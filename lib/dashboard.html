@@ -1,0 +1,142 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>MacTools · 控制台</title>
+<style>
+  :root{--bg:#0d1117;--card:#161b22;--line:#30363d;--fg:#e6edf3;--dim:#8b949e;
+        --accent:#58a6ff;--ok:#3fb950;--warn:#d29922;--hot:#f85149;--cyan:#39c5cf}
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--fg);padding:26px;
+       font:14px/1.55 -apple-system,BlinkMacSystemFont,"PingFang SC",sans-serif;max-width:980px;margin:0 auto}
+  h1{font-size:19px;margin:0 0 4px;font-weight:600}
+  .lead{color:var(--dim);font-size:13px;margin:0 0 22px}
+  .svc{background:var(--card);border:1px solid var(--line);border-radius:12px;
+       padding:16px 18px;margin-bottom:12px;display:flex;gap:16px;align-items:flex-start}
+  .svc .ico{font-size:26px;line-height:1;margin-top:2px}
+  .svc .main{flex:1;min-width:0}
+  .svc .nm{font-size:15px;font-weight:600;display:flex;align-items:center;gap:10px;flex-wrap:wrap}
+  .svc .ds{color:var(--dim);font-size:13px;margin:4px 0 8px}
+  .svc .meta{font-size:11.5px;color:var(--dim);font-family:ui-monospace,Menlo,monospace}
+  .badge{font-size:11px;font-weight:500;padding:2px 9px;border-radius:20px;border:1px solid transparent}
+  .badge.managed{color:var(--ok);border-color:#238636;background:rgba(63,185,80,.12)}
+  .badge.external{color:var(--accent);border-color:#1f6feb;background:rgba(88,166,255,.12)}
+  .badge.stopped{color:var(--dim);border-color:var(--line);background:#1c2128}
+  .ops{display:flex;gap:8px;margin-top:12px;flex-wrap:wrap}
+  button{background:#21262d;color:var(--fg);border:1px solid var(--line);border-radius:7px;
+         padding:6px 14px;font-size:13px;cursor:pointer;transition:.15s}
+  button:hover:not(:disabled){border-color:#484f58;background:#2d333b}
+  button.primary{background:#238636;border-color:#2ea043;color:#fff}
+  button.primary:hover:not(:disabled){background:#2ea043}
+  button.danger{color:var(--hot);border-color:#6e2b2b}
+  button.danger:hover:not(:disabled){background:#3d1f1f}
+  button:disabled{opacity:.45;cursor:wait}
+  .frame{margin-top:20px;border:1px solid var(--line);border-radius:12px;overflow:hidden;background:var(--card)}
+  .frame header{display:flex;justify-content:space-between;align-items:center;
+                padding:9px 14px;border-bottom:1px solid var(--line);font-size:13px;color:var(--dim)}
+  .frame iframe{width:100%;height:660px;border:0;background:#fff;display:block}
+  .hidden{display:none}
+  .flash{margin-top:14px;font-size:12.5px;color:var(--dim);font-family:ui-monospace,Menlo,monospace;min-height:18px}
+  code{background:#1c2128;padding:1px 6px;border-radius:4px;font-size:12px}
+  footer{margin-top:26px;color:var(--dim);font-size:12px;border-top:1px solid var(--line);padding-top:14px}
+</style>
+</head>
+<body>
+  <h1>MacTools · 控制台</h1>
+  <p class="lead">默认不启动任何服务 — 点「启动」才拉起对应进程，不用了点「停止」释放端口。</p>
+
+  <div id="list"><div class="svc"><div class="main">加载中…</div></div></div>
+  <div class="flash" id="flash"></div>
+
+  <div class="frame hidden" id="frame">
+    <header>
+      <span id="frame-title">—</span>
+      <button onclick="closeFrame()">关闭面板</button>
+    </header>
+    <iframe id="iframe" src=""></iframe>
+  </div>
+
+  <footer>
+    命令行等价操作：<code>node manager.js --no-open</code> · 端口：<code id="mp">—</code> ·
+    子服务冲突时控制台会自动接管已占用的端口
+  </footer>
+
+<script>
+const $ = id => document.getElementById(id);
+let STATE = [], busy = new Set();
+
+async function api(path, method){
+  const r = await fetch(path, {method: method || 'GET'});
+  return r.json();
+}
+
+function flash(msg){ $('flash').textContent = msg; setTimeout(()=>{ if($('flash').textContent===msg) $('flash').textContent=''; }, 6000); }
+
+async function op(id, kind){
+  if(busy.has(id)) return;
+  busy.add(id); render();
+  const r = await api(`/api/services/${id}/${kind}`, 'POST');
+  if(!r.ok) flash(`${id} ${kind} 失败: ${r.error || JSON.stringify(r)}`);
+  else if(kind==='start') flash(`${id} 已启动${r.adopted?`（接管已有进程 PID ${r.adopted}）`:''}`);
+  else flash(`${id} 已停止${r.killed&&r.killed.length?`（PID ${r.killed.join(',')}）`:''}`);
+  busy.delete(id);
+  await refresh();
+  if(kind==='stop' && STATE.find(s=>s.id===id)?.port === framePort){ closeFrame(); }
+}
+
+async function openSvc(id){
+  const s = STATE.find(x=>x.id===id); if(!s) return;
+  if(!s.running){ await op(id,'start'); await refresh(); const t=STATE.find(x=>x.id===id); if(!t.running) return; }
+  framePort = s.port;
+  $('frame-title').textContent = s.name + '  ·  ' + s.url;
+  $('iframe').src = s.url;
+  $('frame').classList.remove('hidden');
+  $('frame').scrollIntoView({behavior:'smooth', block:'start'});
+}
+
+function closeFrame(){
+  $('frame').classList.add('hidden');
+  $('iframe').src = 'about:blank';
+  framePort = null;
+}
+
+let framePort = null;
+
+function render(){
+  $('mp').textContent = location.port;
+  if(!STATE.length){ $('list').innerHTML = '<div class="svc"><div class="main">加载中…</div></div>'; return; }
+  $('list').innerHTML = STATE.map(s=>{
+    const badge = s.status==='managed' ? '<span class="badge managed">运行中</span>'
+                : s.status==='external' ? '<span class="badge external">运行中（外部进程）</span>'
+                : '<span class="badge stopped">已停止</span>';
+    return `<div class="svc">
+      <div class="ico">${s.icon}</div>
+      <div class="main">
+        <div class="nm">${s.name} ${badge}</div>
+        <div class="ds">${s.desc}</div>
+        <div class="meta">端口 ${s.port}${s.pid?` · PID ${s.pid}`:''} · ${s.note}</div>
+        <div class="ops">
+          ${s.running
+            ? `<button class="primary" onclick="openSvc('${s.id}')">打开面板</button>
+               <button class="danger" onclick="op('${s.id}','stop')" ${busy.has(s.id)?'disabled':''}>停止</button>
+               <button onclick="newTab('${s.id}')">新标签页</button>`
+            : `<button class="primary" onclick="op('${s.id}','start')" ${busy.has(s.id)?'disabled':''}>启动</button>`}
+        </div>
+      </div>
+    </div>`;
+  }).join('');
+}
+
+function newTab(id){ const s=STATE.find(x=>x.id===id); if(s) window.open(s.url,'_blank'); }
+
+async function refresh(){
+  const d = await api('/api/services');
+  STATE = d.services; render();
+}
+
+refresh();
+setInterval(refresh, 3000);
+</script>
+</body>
+</html>

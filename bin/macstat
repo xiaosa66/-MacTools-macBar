@@ -1,0 +1,357 @@
+#!/usr/bin/env python3
+"""macstat — Mac 状态速览
+
+输出 CPU 温度 / SoC 功耗 / 整机取电功率 / CPU 频率 / 内存 / 电池。
+
+数据源:
+  - 温度、SoC 包功耗、频率、内存: macmon（免 sudo），~/.local/bin/macmon
+  - 取电功率、PD 协商档位、电池: AppleSmartBattery via ioreg（免 sudo）
+    注: PowerTelemetryData 由系统每 5~20 秒刷新一次，读数自带缓存（见 get_power）。
+
+用法:
+    macstat              # 采样 4 次（约 4 秒），给温度序列与趋势
+    macstat -n 8         # 采样 8 次
+    macstat -i 2000      # 间隔 2 秒
+    macstat -w           # 持续监控，Ctrl-C 退出
+    macstat -p           # 只看电源/取电/电池（不动 macmon，秒回）
+    macstat --json       # 原始采样数据 + power 段
+"""
+
+import argparse
+import json
+import os
+import plistlib
+import subprocess
+import sys
+import time
+
+MACMON = os.path.expanduser("~/.local/bin/macmon")
+GB = 1024 ** 3
+MIN_INTERVAL = 1000  # macmon 低于 1000ms 时 sys_power 会失真，硬性下限
+MAX_PLAUSIBLE_W = 100  # 超过这个数的功耗读数一律视为异常丢弃（M1 Air 整机上限 ~45W）
+POWER_TTL = 5.0  # ioreg 读数缓存秒数（底层的更新周期就是这个量级，刷新更快没意义）
+
+ESC = "\033["
+RESET = ESC + "0m"
+DIM = ESC + "2m"
+GREEN = ESC + "32m"
+YELLOW = ESC + "33m"
+RED = ESC + "31m"
+
+COLOR_ON = True
+
+
+def paint(text, code):
+    if not COLOR_ON:
+        return text
+    return code + text + RESET
+
+
+def temp_color(t):
+    if t >= 85:
+        return RED
+    if t >= 65:
+        return YELLOW
+    return GREEN
+
+
+# ---------------------------------------------------------------- macmon 部分
+
+
+def collect(n, interval):
+    """跑一次 macmon pipe，返回 n 条采样字典。"""
+    try:
+        proc = subprocess.run(
+            [MACMON, "pipe", "-s", str(n), "-i", str(interval)],
+            capture_output=True,
+            text=True,
+            timeout=max(30, n * interval // 1000 + 20),
+        )
+    except FileNotFoundError:
+        raise RuntimeError("找不到 %s" % MACMON)
+    except subprocess.TimeoutExpired:
+        raise RuntimeError("macmon 采样超时")
+
+    rows = []
+    for line in proc.stdout.splitlines():
+        line = line.strip()
+        if not line.startswith("{"):
+            continue
+        try:
+            rows.append(json.loads(line))
+        except ValueError:
+            continue
+
+    if not rows:
+        raise RuntimeError((proc.stderr or proc.stdout or "macmon 无输出").strip())
+    return rows[-n:] if len(rows) > n else rows
+
+
+def temp_series(rows):
+    return [t for t in ((r.get("temp") or {}).get("cpu_temp_avg") or 0 for r in rows) if t > 0]
+
+
+def power_series(rows):
+    return [w for w in (r.get("sys_power") or 0 for r in rows) if 0 < w < MAX_PLAUSIBLE_W]
+
+
+def avg_freq(rows, key):
+    vals = [v for v in (r.get(key) or 0 for r in rows) if v > 0]
+    return sum(vals) / len(vals) if vals else 0.0
+
+
+def trend_label(ts):
+    if len(ts) < 2:
+        return ""
+    delta = ts[-1] - ts[0]
+    if delta > 2:
+        return "↗ 升温"
+    if delta < -2:
+        return "↘ 降温"
+    return "→ 平稳"
+
+
+# ------------------------------------------------------------ 取电/电池 部分
+
+
+_power_cache = {"ts": 0.0, "data": None}
+
+
+def read_power():
+    """从 AppleSmartBattery 读一次取电/电池状态，返回 dict；失败返回 None。"""
+    try:
+        raw = subprocess.run(
+            ["ioreg", "-r", "-c", "AppleSmartBattery", "-a", "-w0"],
+            capture_output=True,
+            timeout=15,
+        ).stdout
+        node = plistlib.loads(raw)[0]
+    except Exception:
+        return None
+
+    tel = node.get("PowerTelemetryData") or {}
+    ad = node.get("AdapterDetails") or {}
+    bd = node.get("BatteryData") or {}
+
+    full = bd.get("FullChargeCapacity") or 0
+    design = bd.get("DesignCapacity") or 0
+
+    def w(key):
+        return round((tel.get(key) or 0) / 1000.0, 1)  # mW -> W
+
+    return {
+        "on_ac": bool(node.get("ExternalConnected")),
+        "charging": bool(node.get("IsCharging")),
+        "fully_charged": bool(node.get("FullyCharged")),
+        "soc": node.get("CurrentCapacity"),  # 百分比
+        "cycles": node.get("CycleCount"),
+        "full_mah": full,
+        "design_mah": design,
+        "health": round(full * 100.0 / design, 1) if design and full else None,
+        "eta_min": node.get("AvgTimeToFull") or node.get("AvgTimeToEmpty") or 0,
+        "adapter_w": ad.get("Watts") if ad.get("Watts") else None,
+        "pd_volt": round((ad.get("AdapterVoltage") or 0) / 1000.0, 2),  # mV -> V
+        "pd_amp": round((ad.get("Current") or 0) / 1000.0, 2),  # mA -> A
+        "in_v": round((tel.get("SystemVoltageIn") or 0) / 1000.0, 2),
+        "in_a": round((tel.get("SystemCurrentIn") or 0) / 1000.0, 2),
+        "in_w": w("SystemPowerIn"),  # 整机入口功率
+        "sys_w": w("SystemLoad"),  # 整机负载净功耗
+        "batt_w": w("BatteryPower"),  # 充电为正 / 放电为负
+        "loss_w": w("AdapterEfficiencyLoss"),  # 适配器转换损耗
+    }
+
+
+def get_power(max_age=POWER_TTL):
+    """带 TTL 缓存地取电源数据。"""
+    if time.time() - _power_cache["ts"] > max_age:
+        _power_cache["data"] = read_power()
+        _power_cache["ts"] = time.time()
+    return _power_cache["data"]
+
+
+def fmt_eta(mins):
+    if not mins or mins <= 0 or mins >= 65535:
+        return "估算中"
+    return "%dh%02dm" % (mins // 60, mins % 60) if mins >= 60 else "%d 分钟" % mins
+
+
+def power_lines(p, rows):
+    """生成电源相关的展示行。rows 可为 None（纯 -p 模式）。"""
+    lines = []
+    if not p:
+        lines.append("电源     : 读取失败（ioreg AppleSmartBattery 不可用）")
+        return lines
+
+    soc_w = None
+    if rows:
+        ps = power_series(rows)
+        soc_w = ps[-1] if ps else None
+
+    # 行 1：电源来源与 PD 协商
+    if p["on_ac"]:
+        head = "电源     : AC 接入"
+        if p["adapter_w"]:
+            head += " · 适配器 %dW" % p["adapter_w"]
+        if p["pd_volt"]:
+            head += " · PD 档 %.1fV/%.1fA" % (p["pd_volt"], p["pd_amp"])
+        if p["in_v"]:
+            head += paint(" · 实测 %.1fV/%.2fA" % (p["in_v"], p["in_a"]), DIM)
+        lines.append(head)
+    else:
+        lines.append("电源     : " + paint("电池供电", YELLOW))
+
+    # 行 2：取电功率
+    if p["on_ac"] and p["in_w"] > 0:
+        parts = []
+        if p["sys_w"] > 0:
+            parts.append("负载 %.1fW" % p["sys_w"])
+        if abs(p["batt_w"]) > 0.05:
+            arrow = "充电" if p["batt_w"] > 0 else "放电"
+            parts.append("%s %.1fW" % (arrow, abs(p["batt_w"])))
+        if p["loss_w"] > 0:
+            parts.append("损耗 %.1fW" % p["loss_w"])
+        tail = ("  (" + " + ".join(parts) + ")") if parts else ""
+        lines.append("取电功率 : " + paint("%.1f W" % p["in_w"], GREEN) + paint(tail, DIM))
+    elif soc_w:
+        lines.append("取电功率 : " + paint("n/a（未接 AC）", DIM))
+
+    # 行 3：SoC 包功耗
+    if soc_w:
+        lines.append("SoC 功耗 : " + paint("%.1f W" % soc_w, GREEN) + paint("  macmon 口径", DIM))
+
+    # 行 4：电池
+    soc = p["soc"]
+    if soc is not None:
+        if p["fully_charged"]:
+            state = paint("已充满", GREEN)
+        elif p["charging"]:
+            state = paint("↑ 充电中 · %s后满" % fmt_eta(p["eta_min"]), GREEN)
+        elif p["on_ac"]:
+            state = paint("→ 未充（已接 AC）", DIM)
+        else:
+            state = paint("↓ 放电 · 可用 %s" % fmt_eta(p["eta_min"]), YELLOW)
+        line = "电池     : %d%%  %s" % (soc, state)
+        extra = []
+        if p["cycles"] is not None:
+            extra.append("循环 %d" % p["cycles"])
+        if p["health"]:
+            extra.append("健康 %.0f%% (%d/%d mAh)" % (p["health"], p["full_mah"], p["design_mah"]))
+        if extra:
+            line += "   " + paint("· " + " · ".join(extra), DIM)
+        lines.append(line)
+
+    return lines
+
+
+# ------------------------------------------------------------------- 渲染
+
+
+def render(rows, compact=False):
+    lines = []
+
+    ts = temp_series(rows) if rows else []
+    if ts:
+        cur = ts[-1]
+        line = "CPU 温度 : " + paint("%4.1f °C" % cur, temp_color(cur))
+        if not compact and len(ts) > 1:
+            chain = " → ".join("%.1f" % t for t in ts)
+            line += "   " + paint("← %s   %s" % (chain, trend_label(ts)), DIM)
+        lines.append(line)
+    else:
+        lines.append("CPU 温度 : n/a")
+
+    if rows:
+        pf = avg_freq(rows, "pcpu_freq_mhz")
+        ef = avg_freq(rows, "ecpu_freq_mhz")
+        lines.append("CPU 频率 : p核 ~%.1fGHz / e核 ~%.1fGHz" % (pf / 1000, ef / 1000))
+
+        mem = rows[-1].get("memory") or {}
+        lines.append(
+            "内存     : %.1f / %.0f GB   swap %.1f / %.0f GB"
+            % (
+                mem.get("ram_usage", 0) / GB,
+                mem.get("ram_total", 0) / GB,
+                mem.get("swap_usage", 0) / GB,
+                mem.get("swap_total", 0) / GB,
+            )
+        )
+
+    lines.extend(power_lines(get_power(), rows))
+    return lines
+
+
+def main():
+    global COLOR_ON
+
+    ap = argparse.ArgumentParser(
+        prog="macstat",
+        description="Mac 状态速览：CPU 温度 / SoC 功耗 / 取电功率 / 频率 / 内存 / 电池",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    ap.add_argument("-n", "--samples", type=int, default=4, help="采样次数（默认 4）")
+    ap.add_argument(
+        "-i",
+        "--interval",
+        type=int,
+        default=MIN_INTERVAL,
+        help="采样间隔毫秒，最低 %d（默认 %d）" % (MIN_INTERVAL, MIN_INTERVAL),
+    )
+    ap.add_argument("-w", "--watch", action="store_true", help="持续监控，Ctrl-C 退出")
+    ap.add_argument(
+        "-p", "--power", action="store_true", help="只看电源/取电/电池（不跑 macmon）"
+    )
+    ap.add_argument("--json", action="store_true", help="输出原始采样数据")
+    ap.add_argument("--no-color", action="store_true", help="禁用颜色")
+    args = ap.parse_args()
+
+    COLOR_ON = sys.stdout.isatty() and not args.no_color
+    interval = max(MIN_INTERVAL, args.interval)
+
+    # 纯电源模式：不碰 macmon
+    if args.power:
+        payload = {"power": get_power(0)}
+        print(json.dumps(payload, indent=2, ensure_ascii=False)) if args.json else None
+        if not args.json:
+            for line in power_lines(get_power(0), None):
+                print(line)
+        return
+
+    if args.json:
+        print(json.dumps({"samples": collect(max(1, args.samples), interval), "power": get_power()},
+                         indent=2, ensure_ascii=False))
+        return
+
+    if args.watch:
+        if not sys.stdout.isatty():
+            sys.exit("macstat: -w 需要在终端里跑")
+        hist = []
+        try:
+            while True:
+                hist.extend(collect(1, interval))
+                hist = hist[-8:]
+                sys.stdout.write("\033[2J\033[H")
+                sys.stdout.write("\n".join(render(hist)) + "\n")
+                sys.stdout.write(
+                    "\n"
+                    + paint("每 %.1fs 刷新 · 取电读数每 %.0fs 更新 · Ctrl-C 退出" % (interval / 1000.0, POWER_TTL), DIM)
+                    + "\n"
+                )
+                sys.stdout.flush()
+        except KeyboardInterrupt:
+            sys.stdout.write("\n")
+        except RuntimeError as exc:
+            sys.exit("\nmacstat: %s" % exc)
+        return
+
+    try:
+        rows = collect(max(1, args.samples), interval)
+    except RuntimeError as exc:
+        rows = []
+        if not args.power:
+            sys.stderr.write("macstat: %s（跳过 SoC 指标）\n" % exc)
+    for line in render(rows, compact=args.samples <= 1):
+        print(line)
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,12 @@
+#!/bin/sh
+# MacTools 控制台启动器（支持通过软链接调用）
+TARGET="$0"
+while [ -L "$TARGET" ]; do
+  DIR=$(dirname "$TARGET")
+  TARGET=$(readlink "$TARGET")
+  case "$TARGET" in
+    /*) ;;
+    *) TARGET="$DIR/$TARGET" ;;
+  esac
+done
+exec node "$(dirname "$TARGET")/../manager.js" "$@"

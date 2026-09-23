@@ -1,0 +1,501 @@
+#!/usr/bin/env python3
+"""macstat-web — Mac 实时状态面板（本地网页）
+
+后台常驻采样两个数据源：
+  - macmon（免 sudo）：CPU 温度 / SoC 包功耗 / 频率 / 内存 / GPU
+  - ioreg AppleSmartBattery（免 sudo）：PD 协商档 / 整机取电功率 / 电池状态
+然后起一个本地 HTTP 服务，浏览器打开即可看实时曲线。
+
+用法:
+    macstat-web              # 默认 http://127.0.0.1:8787 并自动打开浏览器
+    macstat-web --port 9000
+    macstat-web --interval 2000        # 采样间隔毫秒
+    macstat-web --no-open              # 不起浏览器
+    macstat-web --host 0.0.0.0         # 允许局域网访问（慎用）
+
+Ctrl-C 退出。
+"""
+
+import argparse
+import json
+import os
+import plistlib
+import signal
+import subprocess
+import sys
+import threading
+import time
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+MACMON = os.path.expanduser("~/.local/bin/macmon")
+GB = 1024 ** 3
+MAX_PLAUSIBLE_W = 100
+POWER_TTL = 5.0  # ioreg 底层读数就是这个更新量级，读更快没有新信息
+
+
+# ---------------------------------------------------------------- 电源采集
+# 与 ~/scripts/macstat 同源，此处保留独立副本：Web 是常驻进程，
+# 不应被 CLI 脚本的编辑牵连。
+
+
+def read_power():
+    try:
+        raw = subprocess.run(
+            ["ioreg", "-r", "-c", "AppleSmartBattery", "-a", "-w0"],
+            capture_output=True,
+            timeout=15,
+        ).stdout
+        node = plistlib.loads(raw)[0]
+    except Exception:
+        return None
+
+    tel = node.get("PowerTelemetryData") or {}
+    ad = node.get("AdapterDetails") or {}
+    bd = node.get("BatteryData") or {}
+    full = bd.get("FullChargeCapacity") or 0
+    design = bd.get("DesignCapacity") or 0
+
+    def w(key):
+        return round((tel.get(key) or 0) / 1000.0, 1)
+
+    return {
+        "on_ac": bool(node.get("ExternalConnected")),
+        "charging": bool(node.get("IsCharging")),
+        "fully_charged": bool(node.get("FullyCharged")),
+        "soc": node.get("CurrentCapacity"),
+        "cycles": node.get("CycleCount"),
+        "full_mah": full,
+        "design_mah": design,
+        "health": round(full * 100.0 / design, 1) if design and full else None,
+        "eta_min": node.get("AvgTimeToFull") or node.get("AvgTimeToEmpty") or 0,
+        "adapter_w": ad.get("Watts") or None,
+        "pd_volt": round((ad.get("AdapterVoltage") or 0) / 1000.0, 2),
+        "pd_amp": round((ad.get("Current") or 0) / 1000.0, 2),
+        "in_v": round((tel.get("SystemVoltageIn") or 0) / 1000.0, 2),
+        "in_a": round((tel.get("SystemCurrentIn") or 0) / 1000.0, 2),
+        "in_w": w("SystemPowerIn"),
+        "sys_w": w("SystemLoad"),
+        "batt_w": w("BatteryPower"),
+        "loss_w": w("AdapterEfficiencyLoss"),
+    }
+
+
+# ------------------------------------------------------------------ 采样器
+
+
+class Sampler(threading.Thread):
+    """常驻的 macmon + ioreg 采样线程。"""
+
+    def __init__(self, interval_ms):
+        super().__init__(daemon=True)
+        self.interval = max(1000, interval_ms)
+        self.lock = threading.Lock()
+        self.soc = {}
+        self.power = None
+        self.power_ts = 0.0
+        self.error = None
+        self._stop = threading.Event()
+        self._proc = None
+
+    def stop(self):
+        self._stop.set()
+        if self._proc and self._proc.poll() is None:
+            self._proc.terminate()
+
+    def _pump(self):
+        self._proc = subprocess.Popen(
+            [MACMON, "pipe", "-i", str(self.interval)],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+        )
+        for line in self._proc.stdout:
+            if self._stop.is_set():
+                break
+            line = line.strip()
+            if not line.startswith("{"):
+                continue
+            try:
+                row = json.loads(line)
+            except ValueError:
+                continue
+            p = row.get("sys_power") or 0
+            mem = row.get("memory") or {}
+            temp = row.get("temp") or {}
+            soc = {
+                "ts": time.time(),
+                "cpu_temp": round(temp.get("cpu_temp_avg") or 0, 1),
+                "gpu_temp": round(temp.get("gpu_temp_avg") or 0, 1),
+                "soc_w": round(p, 1) if 0 < p < MAX_PLAUSIBLE_W else None,
+                "pcpu_mhz": row.get("pcpu_freq_mhz") or 0,
+                "ecpu_mhz": row.get("ecpu_freq_mhz") or 0,
+                "gpu_mhz": row.get("gpu_freq_mhz") or 0,
+                "cpu_pct": round((row.get("cpu_usage_pct") or 0) * 100, 1),
+                "ram_used": round(mem.get("ram_usage", 0) / GB, 2),
+                "ram_total": round(mem.get("ram_total", 0) / GB, 2),
+                "swap_used": round(mem.get("swap_usage", 0) / GB, 2),
+                "swap_total": round(mem.get("swap_total", 0) / GB, 2),
+            }
+            with self.lock:
+                self.soc = soc
+                self.error = None
+
+    def run(self):
+        while not self._stop.is_set():
+            try:
+                self._pump()
+            except FileNotFoundError:
+                self.error = "找不到 %s" % MACMON
+                return
+            except Exception as exc:  # macmon 崩了就重启
+                self.error = str(exc)
+            if self._stop.is_set():
+                break
+            time.sleep(1.0)
+
+    def _refresh_power(self):
+        if time.time() - self.power_ts < POWER_TTL:
+            return
+        p = read_power()
+        if p is not None:
+            with self.lock:
+                self.power = p
+                self.power_ts = time.time()
+
+    def snapshot(self):
+        self._refresh_power()
+        with self.lock:
+            return {"soc": dict(self.soc), "power": self.power, "error": self.error}
+
+
+# ------------------------------------------------------------------- HTTP
+
+
+PAGE = r"""<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>macstat · 实时状态</title>
+<style>
+  :root{
+    --bg:#0d1117; --card:#161b22; --line:#30363d; --fg:#e6edf3;
+    --dim:#8b949e; --accent:#58a6ff; --ok:#3fb950; --warn:#d29922;
+    --hot:#f85149; --cyan:#39c5cf; --violet:#bc8cff;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--fg);
+       font:14px/1.5 -apple-system,BlinkMacSystemFont,"PingFang SC",sans-serif;
+       padding:24px;max-width:1100px;margin:0 auto}
+  h1{font-size:18px;margin:0 0 2px;font-weight:600}
+  h1 span{color:var(--dim);font-weight:400;font-size:13px;margin-left:8px}
+  .top{display:flex;align-items:baseline;justify-content:space-between;margin-bottom:18px}
+  .status{font-size:12px;color:var(--dim);font-family:ui-monospace,SFMono-Regular,Menlo,monospace}
+  .dot{display:inline-block;width:8px;height:8px;border-radius:50%;background:var(--ok);
+       margin-right:6px;vertical-align:middle}
+  .dot.bad{background:var(--hot)}
+  .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(190px,1fr));gap:12px;margin-bottom:16px}
+  .card{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:14px 16px}
+  .card .lab{font-size:12px;color:var(--dim);margin-bottom:6px}
+  .card .val{font-size:26px;font-weight:600;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;
+             line-height:1.2}
+  .card .val small{font-size:13px;font-weight:400;color:var(--dim);margin-left:3px}
+  .card .sub{font-size:11.5px;color:var(--dim);margin-top:6px;font-family:ui-monospace,Menlo,monospace}
+  .chart{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:14px 16px 8px}
+  .chart h2{margin:0 0 10px;font-size:13px;font-weight:600;color:var(--dim)}
+  .legend{display:flex;gap:16px;font-size:12px;margin-bottom:8px;flex-wrap:wrap}
+  .legend i{display:inline-block;width:14px;height:3px;border-radius:2px;margin-right:6px;vertical-align:middle}
+  canvas{width:100%;height:210px;display:block}
+  .foot{margin-top:14px;font-size:12px;color:var(--dim);font-family:ui-monospace,Menlo,monospace;
+        display:flex;justify-content:space-between;flex-wrap:wrap;gap:8px}
+  .bar{height:6px;background:#21262d;border-radius:3px;overflow:hidden;margin-top:8px}
+  .bar>i{display:block;height:100%;background:var(--accent);transition:width .4s}
+</style>
+</head>
+<body>
+  <div class="top">
+    <h1>macstat · 实时状态<span id="model">Mac</span></h1>
+    <div class="status"><span class="dot" id="dot"></span><span id="beat">连接中…</span></div>
+  </div>
+
+  <div class="grid">
+    <div class="card">
+      <div class="lab">CPU 温度</div>
+      <div class="val" id="temp">—<small>°C</small></div>
+      <div class="sub" id="temp-sub">—</div>
+    </div>
+    <div class="card">
+      <div class="lab">整机取电功率</div>
+      <div class="val" id="inw">—<small>W</small></div>
+      <div class="sub" id="inw-sub">—</div>
+    </div>
+    <div class="card">
+      <div class="lab">SoC 包功耗</div>
+      <div class="val" id="socw">—<small>W</small></div>
+      <div class="sub" id="socw-sub">—</div>
+    </div>
+    <div class="card">
+      <div class="lab">电池</div>
+      <div class="val" id="soc">—<small>%</small></div>
+      <div class="sub" id="soc-sub">—</div>
+      <div class="bar"><i id="socbar" style="width:0%"></i></div>
+    </div>
+    <div class="card">
+      <div class="lab">CPU 频率 / 占用</div>
+      <div class="val" id="freq">—<small>GHz</small></div>
+      <div class="sub" id="freq-sub">—</div>
+    </div>
+    <div class="card">
+      <div class="lab">内存</div>
+      <div class="val" id="mem">—<small>GB</small></div>
+      <div class="sub" id="mem-sub">—</div>
+      <div class="bar"><i id="membar" style="width:0%"></i></div>
+    </div>
+  </div>
+
+  <div class="chart">
+    <h2>最近 <span id="win">10</span> 分钟</h2>
+    <div class="legend">
+      <span><i style="background:var(--hot)"></i>温度 °C <b id="lg-t">—</b></span>
+      <span><i style="background:var(--cyan)"></i>取电 W <b id="lg-i">—</b></span>
+      <span><i style="background:var(--ok)"></i>SoC W <b id="lg-s">—</b></span>
+    </div>
+    <canvas id="cv"></canvas>
+  </div>
+
+  <div class="foot">
+    <span id="src">数据源: macmon + ioreg AppleSmartBattery</span>
+    <span id="misc">—</span>
+  </div>
+
+<script>
+const MAXPTS = 600, COLD="#f85149", CYAN="#39c5cf", OK="#3fb950", GRID="#21262d", DIM="#8b949e";
+const H = [], IW = [], SW = [];
+const cv = document.getElementById('cv'), ctx = cv.getContext('2d');
+let lastOK = 0;
+
+function fitCanvas(){
+  const r = window.devicePixelRatio || 1;
+  cv.width = cv.clientWidth * r; cv.height = cv.clientHeight * r;
+  ctx.setTransform(r,0,0,r,0,0);
+}
+
+function push(arr, v){ arr.push(v); if (arr.length > MAXPTS) arr.shift(); }
+
+function fmtMin(m){ if(!m||m>=65535) return '估算中';
+  return m>=60 ? Math.floor(m/60)+'h'+String(m%60).padStart(2,'0')+'m' : m+' 分钟'; }
+
+function draw(){
+  const w = cv.clientWidth, h = cv.clientHeight, pl = 42, pr = 44, pt = 8, pb = 18;
+  ctx.clearRect(0,0,w,h);
+  const iw = w-pl-pr, ih = h-pt-pb;
+  // 温度轴 20~105，功率轴 0~50
+  const lo=20, hi=105, plo=0, phi=50;
+  ctx.strokeStyle=GRID; ctx.lineWidth=1; ctx.fillStyle=DIM;
+  ctx.font='10px ui-monospace,Menlo,monospace';
+  for(let i=0;i<=4;i++){
+    const y = pt + ih*i/4;
+    ctx.beginPath(); ctx.moveTo(pl,y); ctx.lineTo(pl+iw,y); ctx.stroke();
+    ctx.textAlign='right'; ctx.fillStyle=COLD;
+    ctx.fillText((hi-(hi-lo)*i/4).toFixed(0)+'°', pl-6, y+3);
+    ctx.textAlign='left'; ctx.fillStyle=OK;
+    ctx.fillText((phi-(phi-plo)*i/4).toFixed(0)+'W', pl+iw+6, y+3);
+  }
+  if(H.length<2){ return; }
+  const n = H.length, step = iw/(MAXPTS-1), x0 = pl + iw - (n-1)*step;
+  function line(arr,axis,color,width){
+    ctx.beginPath();
+    let started=false;
+    for(let k=0;k<n;k++){
+      const v = arr[k]; if(v==null) continue;
+      let y;
+      if(axis==='t'){ y = pt + ih*(1-(Math.min(v,hi)-lo)/(hi-lo)); }
+      else { y = pt + ih*(1-(Math.min(v,phi)-plo)/(phi-plo)); }
+      const x = x0 + k*step;
+      if(!started){ ctx.moveTo(x,y); started=true; } else ctx.lineTo(x,y);
+    }
+    ctx.strokeStyle=color; ctx.lineWidth=width||1.6; ctx.lineJoin='round'; ctx.stroke();
+  }
+  line(H,'t',COLD); line(IW,'p',CYAN); line(SW,'p',OK,1.2);
+}
+
+function set(id,v){ const e=document.getElementById(id); if(e) e.innerHTML=v; }
+
+function setVal(id,v,unit,color){
+  const e=document.getElementById(id);
+  e.innerHTML = (v==null?'—':v)+'<small>'+unit+'</small>';
+  e.style.color = color || 'var(--fg)';
+}
+
+function tick(){
+  fetch('/api/status').then(r=>r.json()).then(d=>{
+    lastOK = Date.now();
+    document.getElementById('dot').className='dot';
+    document.getElementById('beat').textContent='实时 · '+new Date().toLocaleTimeString('zh-CN');
+
+    const s = d.soc||{}, p = d.power||{};
+    // 温度
+    const t = s.cpu_temp;
+    setVal('temp', t, '°C', t>=85?'var(--hot)':(t>=65?'var(--warn)':'var(--ok)'));
+    set('temp-sub', (t>=90?'降频区':(t>=70?'偏高':'正常')) + (s.gpu_temp? ' · GPU '+s.gpu_temp.toFixed(0)+'°':''));
+    // 取电
+    if(p.on_ac && p.in_w>0){
+      setVal('inw', p.in_w.toFixed(1), 'W', 'var(--ok)');
+      const parts=[];
+      if(p.sys_w>0) parts.push('负载 '+p.sys_w.toFixed(1)+'W');
+      if(Math.abs(p.batt_w)>0.05) parts.push((p.batt_w>0?'充电 ':'放电 ')+Math.abs(p.batt_w).toFixed(1)+'W');
+      if(p.loss_w>0) parts.push('损耗 '+p.loss_w.toFixed(1)+'W');
+      set('inw-sub', parts.join(' + ') + ' · ' + p.in_v.toFixed(1)+'V/'+p.in_a.toFixed(2)+'A');
+    } else {
+      setVal('inw','—','','var(--dim)');
+      set('inw-sub', p.on_ac? '读数刷新中' : '电池供电 · 无取电');
+    }
+    // SoC
+    setVal('socw', s.soc_w!=null? s.soc_w.toFixed(1):null, 'W', 'var(--ok)');
+    set('socw-sub', 'macmon 口径');
+    // 电池
+    if(p.soc!=null){
+      let st, col='var(--fg)';
+      if(p.fully_charged){ st='已充满'; col='var(--ok)'; }
+      else if(p.charging){ st='↑ 充电 · '+fmtMin(p.eta_min)+'后满'; col='var(--ok)'; }
+      else if(p.on_ac){ st='→ 已接电未充'; }
+      else { st='↓ 放电 · 可用 '+fmtMin(p.eta_min); col='var(--warn)'; }
+      setVal('soc', p.soc, '%', col);
+      set('soc-sub', st);
+      document.getElementById('socbar').style.width = p.soc+'%';
+      document.getElementById('socbar').style.background = col;
+    }
+    // 频率
+    setVal('freq', (s.pcpu_mhz/1000).toFixed(2), 'GHz');
+    set('freq-sub','p核 · e核 '+(s.ecpu_mhz/1000).toFixed(2)+'GHz · 占用 '+s.cpu_pct+'%');
+    // 内存
+    setVal('mem', s.ram_used, 'GB');
+    const mpct = s.ram_total? (s.ram_used/s.ram_total*100):0;
+    set('mem-sub','/ '+s.ram_total+' GB · '+mpct.toFixed(0)+'% · swap '+s.swap_used+'/'+s.swap_total+' GB');
+    document.getElementById('membar').style.width = mpct+'%';
+    document.getElementById('membar').style.background = mpct>85?'var(--hot)':'var(--accent)';
+    // 图例 & 序列
+    set('lg-t', t!=null? t.toFixed(1):'—');
+    set('lg-i', p.on_ac? p.in_w.toFixed(1):'—');
+    set('lg-s', s.soc_w!=null? s.soc_w.toFixed(1):'—');
+    push(H, t); push(IW, p.on_ac? p.in_w : null); push(SW, s.soc_w);
+    draw();
+    // 页脚
+    set('misc',
+      (p.on_ac? 'PD 档 '+(p.pd_volt||0).toFixed(1)+'V/'+(p.pd_amp||0).toFixed(1)+'A · 适配器 '+(p.adapter_w||'?')+'W'
+              : '电池供电') +
+      ' · 循环 '+(p.cycles||'?') + ' · 健康 '+(p.health? p.health.toFixed(0)+'%':'?') +
+      ' · GPU '+(s.gpu_mhz||0)+'MHz');
+    if(d.error){ document.getElementById('beat').textContent = '采样异常: '+d.error;
+                 document.getElementById('dot').className='dot bad'; }
+  }).catch(e=>{
+    document.getElementById('dot').className='dot bad';
+    document.getElementById('beat').textContent='采样中断，重连中…';
+  });
+}
+
+window.addEventListener('resize', ()=>{ fitCanvas(); draw(); });
+fetch('/api/model').then(r=>r.json()).then(d=>set('model', d.model)).catch(()=>{});
+fitCanvas(); tick(); setInterval(tick, 1000);
+</script>
+</body>
+</html>
+"""
+
+
+def machine_model():
+    try:
+        out = subprocess.run(
+            ["sysctl", "-n", "machdep.cpu.brand_string"], capture_output=True, text=True
+        ).stdout.strip()
+        hw = subprocess.run(
+            ["sysctl", "-n", "hw.model"], capture_output=True, text=True
+        ).stdout.strip()
+        return hw or out or "Mac"
+    except Exception:
+        return "Mac"
+
+
+def make_handler(sampler, interval_ms):
+    class Handler(BaseHTTPRequestHandler):
+        def log_message(self, *a):
+            pass
+
+        def _send(self, code, body, ctype):
+            self.send_response(code)
+            self.send_header("Content-Type", ctype)
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            self.wfile.write(body)
+
+        def do_GET(self):
+            if self.path.startswith("/api/status"):
+                snap = sampler.snapshot()
+                snap["interval_ms"] = interval_ms
+                body = json.dumps(snap, ensure_ascii=False).encode()
+                self._send(200, body, "application/json; charset=utf-8")
+            elif self.path.startswith("/api/model"):
+                body = json.dumps({"model": MACHINE_MODEL}, ensure_ascii=False).encode()
+                self._send(200, body, "application/json; charset=utf-8")
+            elif self.path in ("/", "/index.html"):
+                self._send(200, PAGE.encode(), "text/html; charset=utf-8")
+            else:
+                self._send(404, b"not found", "text/plain")
+
+    return Handler
+
+
+MACHINE_MODEL = ""
+
+
+def main():
+    ap = argparse.ArgumentParser(prog="macstat-web", description="Mac 实时状态面板")
+    ap.add_argument("--port", type=int, default=8787)
+    ap.add_argument("--host", default="127.0.0.1")
+    ap.add_argument("--interval", type=int, default=1000, help="采样间隔毫秒（默认 1000）")
+    ap.add_argument("--no-open", action="store_true", help="不自动打开浏览器")
+    args = ap.parse_args()
+
+    global MACHINE_MODEL
+    MACHINE_MODEL = machine_model()
+    interval = max(1000, args.interval)
+
+    if not os.path.exists(MACMON):
+        sys.exit("macstat-web: 找不到 %s，SoC 温度/功耗将不可用" % MACMON)
+
+    sampler = Sampler(interval)
+    sampler.start()
+    for _ in range(40):  # 等首帧
+        if sampler.snapshot()["soc"]:
+            break
+        time.sleep(0.25)
+
+    handler = make_handler(sampler, interval)
+    srv = ThreadingHTTPServer((args.host, args.port), handler)
+    url = "http://127.0.0.1:%d/" % args.port
+
+    print("macstat-web · %s" % MACHINE_MODEL)
+    print("面板地址: %s   采样间隔 %dms   Ctrl-C 退出" % (url, interval))
+
+    def shutdown(signum, frame):
+        print("\n正在停止…")
+        sampler.stop()
+        threading.Thread(target=srv.shutdown, daemon=True).start()
+
+    signal.signal(signal.SIGINT, shutdown)
+    signal.signal(signal.SIGTERM, shutdown)
+
+    if not args.no_open:
+        subprocess.Popen(["open", url], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+    try:
+        srv.serve_forever()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        sampler.stop()
+
+
+if __name__ == "__main__":
+    main()

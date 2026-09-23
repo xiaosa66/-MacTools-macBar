@@ -1,0 +1,251 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+磁盘空间占用报告 · 本地扫描工具
+用法:  python3 disk_report_server.py  [端口，默认 8765]
+浏览器打开 http://localhost:8765 ，点击「开始扫描」即可。
+只读扫描，不删除、不移动任何文件。
+"""
+import json
+import re
+import subprocess
+import threading
+import uuid
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+
+PORT = int(__import__("sys").argv[1]) if len(__import__("sys").argv) > 1 else 8765
+HOME = str(Path.home())
+JOBS = {}  # job_id -> {"running":bool,"stage":str,"error":str,"results":dict}
+
+
+def run_du_kb(path):
+    """du -sk 单个路径，失败返回 None（不抛出）"""
+    r = subprocess.run(["du", "-sk", path], capture_output=True, text=True, timeout=600)
+    if r.returncode != 0 and not r.stdout.strip():
+        return None
+    try:
+        return int(r.stdout.strip().split("\t")[0])  # KB
+    except Exception:
+        return None
+
+
+def du_children_kb(parent):
+    """父目录下一级各子目录大小 dict{完整路径:KB}"""
+    r = subprocess.run(["du", "-sk"] + [str(p) for p in Path(parent).glob("*")],
+                       capture_output=True, text=True, timeout=900)
+    out = {}
+    for line in r.stdout.splitlines():
+        parts = line.split("\t", 1)
+        if len(parts) == 2:
+            out[parts[1].rstrip("/")] = int(parts[0])
+    return out
+
+
+def human(kb):
+    v = kb * 1024
+    for unit in ["B", "KB", "MB", "GB", "TB"]:
+        if v < 1024 or unit == "TB":
+            return f"{v:.1f} {unit}" if unit != "B" else f"{int(v)} B"
+        v /= 1024
+
+
+def do_scan(job):
+    R = {}
+    try:
+        # 1. 磁盘总览
+        job["stage"] = "读取磁盘总览…"
+        r = subprocess.run(["df", "-k", "/System/Volumes/Data"], capture_output=True, text=True)
+        m = re.search(r"(\d+)\s+(\d+)\s+(\d+)\s+\d+%\s+", r.stdout.splitlines()[-1])
+        if m:
+            total, used, free = (int(m.group(i)) for i in (1, 2, 3))
+            R["disk"] = {"total": total, "used": used, "free": free}
+
+        # 2. 主目录一级
+        job["stage"] = "扫描主目录（最耗时，请耐心等待）…"
+        home = {k: v for k, v in du_children_kb(HOME).items() if not k.endswith("归档")}
+        R["home_top"] = dict(sorted(home.items(), key=lambda x: -x[1])[:10])
+
+        # 3. ~/Library 一级
+        job["stage"] = "扫描 ~/Library …"
+        lib = du_children_kb(HOME + "/Library")
+        R["library_top"] = dict(sorted(lib.items(), key=lambda x: -x[1])[:12])
+
+        # 4. Application Support
+        job["stage"] = "扫描应用数据 Application Support …"
+        apps = du_children_kb(HOME + "/Library/Application Support")
+        R["app_support_top"] = dict(sorted(apps.items(), key=lambda x: -x[1])[:12])
+
+        # 5. Containers
+        job["stage"] = "扫描 Containers …"
+        cont = du_children_kb(HOME + "/Library/Containers")
+        R["containers_top"] = dict(sorted(cont.items(), key=lambda x: -x[1])[:10])
+
+        # 6. /Applications
+        job["stage"] = "扫描已安装应用 …"
+        R["applications_top"] = dict(sorted(du_children_kb("/Applications").items(),
+                                            key=lambda x: -x[1])[:10])
+
+        # 7. 系统区域
+        job["stage"] = "扫描系统区域 …"
+        sysd = {}
+        for p in ["/System/Library/AssetsV2", "/private/var/folders", "/private/var/db",
+                  "/private/var/log", "/private/var/vm", "/usr/local", "/Library",
+                  "/opt/homebrew", "/opt/anaconda3"]:
+            v = run_du_kb(p)
+            if v is not None:
+                sysd[p] = v
+        R["system"] = dict(sorted(sysd.items(), key=lambda x: -x[1]))
+
+        # 8. 废纸篓
+        trash = run_du_kb(HOME + "/.Trash")
+        R["trash_kb"] = trash or 0
+
+        job["results"] = R
+        job["stage"] = "完成"
+    except Exception as e:
+        job["error"] = str(e)
+    finally:
+        job["running"] = False
+
+
+class Handler(BaseHTTPRequestHandler):
+    def _send(self, code, body, ctype="application/json; charset=utf-8"):
+        data = body.encode()
+        self.send_response(code)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
+    def do_GET(self):
+        if self.path in ("/", "/index.html"):
+            self._send(200, PAGE, "text/html; charset=utf-8")
+        elif self.path.startswith("/api/status"):
+            jid = self.path.split("id=")[-1]
+            j = JOBS.get(jid, {"running": False, "error": "未知任务", "stage": "", "results": None})
+            self._send(200, json.dumps(j, ensure_ascii=False))
+        else:
+            self._send(404, '{"error":"not found"}')
+
+    def do_POST(self):
+        if self.path == "/api/scan":
+            jid = uuid.uuid4().hex[:8]
+            JOBS[jid] = {"running": True, "stage": "启动扫描…", "error": "", "results": None}
+            threading.Thread(target=do_scan, args=(JOBS[jid],), daemon=True).start()
+            self._send(200, json.dumps({"job": jid}))
+        else:
+            self._send(404, '{"error":"not found"}')
+
+    def log_message(self, *a):
+        pass
+
+
+PAGE = r"""<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<title>磁盘空间占用报告 · 本地扫描</title>
+<style>
+  body { font-family: -apple-system, "PingFang SC", sans-serif; max-width: 920px; margin: 0 auto; padding: 28px 20px; color:#1d1d1f; background:#f5f5f7; line-height:1.6; }
+  h1 { font-size: 24px; } h2 { font-size: 18px; margin-top: 30px; border-left: 4px solid #0071e3; padding-left: 10px; }
+  .note { font-size: 13px; color: #6e6e73; }
+  .btn { background:#0071e3; color:#fff; border:none; font-size:15px; padding:10px 26px; border-radius:8px; cursor:pointer; }
+  .btn:disabled { background:#9ec5f0; cursor:wait; }
+  .cards { display:flex; gap:14px; flex-wrap:wrap; margin:18px 0; }
+  .stat { flex:1; min-width:150px; background:#fff; border-radius:12px; padding:14px 18px; box-shadow:0 1px 4px rgba(0,0,0,.06); }
+  .stat .v { font-size:24px; font-weight:700; } .stat .k { font-size:12px; color:#6e6e73; }
+  .card { background:#fff; border-radius:12px; padding:16px 20px; margin:14px 0; box-shadow:0 1px 4px rgba(0,0,0,.06); }
+  table { width:100%; border-collapse:collapse; font-size:13.5px; }
+  th { text-align:left; color:#6e6e73; border-bottom:1px solid #e5e5ea; padding:6px 8px; }
+  td { padding:6px 8px; border-bottom:1px solid #f0f0f2; } td.num { text-align:right; white-space:nowrap; font-variant-numeric:tabular-nums; }
+  .bar-wrap { background:#e5e5ea; border-radius:4px; height:7px; width:100%; min-width:90px; display:block; overflow:hidden; }
+  .bar { height:100%; border-radius:4px; background:#0071e3; }
+  .stage { margin:14px 0; padding:12px 16px; background:#eef4fc; border-radius:8px; color:#0b63c5; font-size:14px; }
+  .hidden { display:none; }
+  .name { cursor:help; position:relative; }
+  .name:hover::after { content:attr(data-path); position:absolute; left:0; top:100%; z-index:9;
+    background:#1d1d1f; color:#fff; padding:5px 10px; border-radius:6px; font-size:12px;
+    white-space:nowrap; box-shadow:0 2px 8px rgba(0,0,0,.25); }
+  .copy { background:none; border:1px solid #d2d2d7; border-radius:5px; font-size:11px;
+    padding:1px 7px; cursor:pointer; color:#0071e3; margin-left:6px; vertical-align:middle; }
+  .copy:hover { background:#0071e3; color:#fff; border-color:#0071e3; }
+  .copy.ok { border-color:#34c759; color:#34c759; }
+  footer { margin-top:34px; font-size:12px; color:#8e8e93; }
+</style>
+</head>
+<body>
+<h1>磁盘空间占用报告</h1>
+<p class="note">点击按钮后由本机服务执行只读扫描（du/df），结果回传至本页渲染。不删除、不移动任何文件。</p>
+<p><button class="btn" id="go" onclick="startScan()">开始扫描</button>
+<span class="note" style="margin-left:12px">全程约 1–3 分钟</span></p>
+<div class="stage hidden" id="stage"></div>
+<div id="out"></div>
+<footer>disk_report_server.py · 本地运行 · 端口 8765</footer>
+
+<script>
+const fmt = kb => { let v=kb*1024; const u=["B","KB","MB","GB","TB"];
+  for (let i=0;i<u.length;i++){ if(v<1024||i===u.length-1) return (u[i]==="B"?Math.round(v)+" B":v.toFixed(1)+" "+u[i]); v/=1024; } };
+const bar = (kb,max,color) => `<span class="bar-wrap"><span class="bar" style="width:${max?Math.max(2,kb/max*100):0}%;background:${color||'#0071e3'}"></span></span>`;
+const color = i => ["#0071e3","#ff9500","#af52de","#30b0c7","#ff3b30","#8e8e93","#34c759"][i%7];
+
+function table(title, obj, note) {
+  const items = Object.entries(obj); if(!items.length) return "";
+  const max = items[0][1];
+  return `<h2>${title}</h2><div class="card"><table>
+    <tr><th>项目</th><th style="text-align:right">大小</th><th>占比</th></tr>` +
+    items.map(([p,v],i)=>{
+      const name = p.split("/").filter(Boolean).pop();
+      return `<tr><td><span class="name" data-path="${p}">${name}</span><button class="copy" data-path="${p}" onclick="copyPath(this)">复制</button></td><td class="num">${fmt(v)}</td><td>${bar(v,max,color(i))}</td></tr>`;
+    }).join("") +
+    `</table>${note?`<p class="note">${note}</p>`:""}</div>`;
+}
+
+function copyPath(btn){
+  const p = btn.dataset.path;
+  const done = ok => { btn.textContent = ok ? "已复制" : "失败"; btn.classList.add("ok");
+    setTimeout(()=>{ btn.textContent="复制"; btn.classList.remove("ok"); }, 1500); };
+  if (navigator.clipboard && navigator.clipboard.writeText) {
+    navigator.clipboard.writeText(p).then(()=>done(true)).catch(()=>fallback());
+  } else fallback();
+  function fallback(){
+    const t = document.createElement("textarea"); t.value = p;
+    t.style.position="fixed"; t.style.opacity="0"; document.body.appendChild(t);
+    t.select();
+    try { document.execCommand("copy"); done(true); } catch(e){ done(false); }
+    document.body.removeChild(t);
+  }
+}
+
+async function startScan(){
+  const btn=document.getElementById("go"), stage=document.getElementById("stage"), out=document.getElementById("out");
+  btn.disabled=true; out.innerHTML=""; stage.classList.remove("hidden"); stage.textContent="正在启动扫描…";
+  const r=await fetch("/api/scan",{method:"POST"}); const {job}=await r.json();
+  const timer=setInterval(async()=>{
+    const s=await (await fetch("/api/status?id="+job)).json();
+    stage.textContent=s.error?("出错: "+s.error):(s.running?("⏳ "+s.stage):"✅ 扫描完成");
+    if(s.running) return;
+    clearInterval(timer); btn.disabled=false; if(s.error) return;
+    const R=s.results; let html="";
+    if(R.disk){ const {total,used,free}=R.disk;
+      html+=`<div class="cards">
+        <div class="stat"><div class="v">${fmt(total)}</div><div class="k">数据卷总容量</div></div>
+        <div class="stat"><div class="v">${fmt(used)}</div><div class="k">已使用</div></div>
+        <div class="stat"><div class="v" style="color:#1d8a3a">${fmt(free)}</div><div class="k">可用空间</div></div>
+        <div class="stat"><div class="v">${R.trash_kb?fmt(R.trash_kb):"0 B"}</div><div class="k">废纸篓</div></div></div>`; }
+    html+=table("主目录占用 Top 10", R.home_top||{});
+    html+=table("用户 Library 占用 Top 12", R.library_top||{});
+    html+=table("应用数据 Application Support Top 12", R.app_support_top||{}, "仅清理缓存子目录（CachedData/Cache 等），整目录删除会丢失应用配置。");
+    html+=table("沙盒数据 Containers Top 10", R.containers_top||{}, "建议在各应用内做缓存清理，勿直接删目录。");
+    html+=table("已安装应用 Top 10", R.applications_top||{});
+    html+=table("系统区域占用", R.system||{}, "/System/Library/AssetsV2 为系统资产（Apple Intelligence 模型等），由 macOS 自动管理，切勿手动删除。");
+    out.innerHTML=html;
+  },1000);
+}
+</script>
+</body>
+</html>"""
+
+if __name__ == "__main__":
+    print(f"磁盘扫描报告服务已启动: http://localhost:{PORT}")
+    ThreadingHTTPServer(("127.0.0.1", PORT), Handler).serve_forever()

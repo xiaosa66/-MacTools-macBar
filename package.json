@@ -1,0 +1,22 @@
+{
+  "name": "mactools",
+  "version": "0.1.0",
+  "private": true,
+  "description": "本机 Mac 运维工具集：实时状态面板、磁盘空间报告、温度/功耗查询",
+  "bin": {
+    "macstat": "./bin/macstat",
+    "macstat-web": "./bin/macstat-web",
+    "disk-report": "./bin/disk-report",
+    "mac-tools": "./bin/mac-tools"
+  },
+  "scripts": {
+    "start": "node manager.js --no-open",
+    "build-menubar": "node bin/build-menubar.js",
+    "menubar:install": "node bin/build-menubar.js --agent",
+    "menubar:restart": "node bin/build-menubar.js --restart"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "license": "MIT"
+}
