@@ -14,7 +14,7 @@ REPO="${1:-MacTools-v2}"
 VIS="--private"
 [ "$2" = "--public" ] && VIS="--public"
 
-GH="${GH_BIN:-$(command -v gh || echo /Users/wuzhengliu/.local/bin/gh)}"
+GH="${GH_BIN:-$(command -v gh || echo "$HOME/.local/bin/gh")}"
 cd "$(dirname "$0")/.."
 
 echo "== gh 版本 =="
