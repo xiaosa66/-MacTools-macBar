@@ -1,0 +1,313 @@
+#!/usr/bin/env python3
+"""brightsync — 内建屏亮度联动外接显示器
+
+用 macOS 原生亮度通道（DisplayServices，即系统设置里那根亮度条背后的接口）
+把内建屏亮度按可配置的映射关系同步到外接显示器。
+
+用法:
+    brightsync status          # 查看内建 / 外接亮度与映射结果（只读）
+    brightsync sync            # 同步一次
+    brightsync set 60          # 直接把外接屏设成 60%
+    brightsync on / off        # 开 / 关跟随（写入配置，watch 立即生效）
+    brightsync watch           # 常驻跟随（Ctrl-C 退出）
+    brightsync map             # 打印映射对照表，用来校锚点
+    brightsync install         # 装 LaunchAgent，开机自启常驻跟随
+    brightsync uninstall       # 卸掉自启
+
+配置: lib/brightsync.json。映射: core.map_brightness()，可整段替换成任意曲线。
+"""
+
+import argparse
+import os
+import plistlib
+import subprocess
+import sys
+import time
+
+ROOT = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
+sys.path.insert(0, os.path.join(ROOT, "lib"))
+
+import brightsync_core as core  # noqa: E402
+
+CONFIG_PATH = core.CONFIG_PATH
+LABEL = "dev.mactools.brightsync"
+PLIST_PATH = os.path.expanduser("~/Library/LaunchAgents/%s.plist" % LABEL)
+
+ESC = "\033["
+RESET = ESC + "0m"
+DIM = ESC + "2m"
+BOLD = ESC + "1m"
+GREEN = ESC + "32m"
+YELLOW = ESC + "33m"
+RED = ESC + "31m"
+
+
+# ---------------------------------------------------------------- 动作
+
+def do_status(as_json=False):
+    cfg = core.load_config()
+    st = core.state(cfg)
+
+    if as_json:
+        import json
+        print(json.dumps(st, ensure_ascii=False, indent=2))
+        return 0
+
+    b = st["builtin"]
+    if b["brightness"] is None:
+        print("%s内建屏不可用%s（合盖或已断开），无法联动。" % (YELLOW, RESET))
+    else:
+        print("%s内建屏%s  id=%-3s  %6.1f%%" % (BOLD, RESET, b["id"], b["brightness"]))
+
+    if not st["external"]:
+        print("%s没有外接显示器。%s" % (YELLOW, RESET))
+    for r in st["external"]:
+        cur = "  ?  " if r["current"] is None else "%5.1f%%" % r["current"]
+        if r["mapped"] is None:
+            print("%s外接屏%s  id=%-3s  %s" % (BOLD, RESET, r["id"], cur))
+            continue
+        same = r["delta"] is not None and abs(r["delta"]) < cfg["minStep"]
+        color = DIM if same else YELLOW
+        mark = "一致" if same else "差 %+.1f" % (r["delta"] or 0)
+        print("%s外接屏%s  id=%-3s  %s   -> 目标 %5.1f%%  %s%s%s"
+              % (BOLD, RESET, r["id"], cur, r["mapped"], color, mark, RESET))
+
+    flag = GREEN + "开启" + RESET if st["enabled"] else DIM + "关闭" + RESET
+    run = (GREEN + "跟随进程运行中 pid=%s" % st["pid"] + RESET) if st["watching"] \
+        else (DIM + "跟随进程未运行" + RESET)
+    print("跟随 %s   %s" % (flag, run))
+    return 0
+
+
+def do_sync(dry=False):
+    ok, internal, target, results = core.sync_once(dry=dry)
+    if internal is None:
+        print("%s读不到内建屏亮度（合盖？），跳过。%s" % (YELLOW, RESET))
+        return 1
+    if not results:
+        print("%s没有外接显示器。%s" % (YELLOW, RESET))
+        return 1
+    for r in results:
+        tag = DIM + "试运行" + RESET if dry else (GREEN + "ok" + RESET if r["ok"] else RED + "失败" + RESET)
+        print("内建 %5.1f%%  ->  外接 id=%-3s  %5.1f%%  %s"
+              % (internal, r["id"], r["target"], tag))
+    return 0 if ok else 1
+
+
+def do_set(pct):
+    ext = core.external_ids()
+    if not ext:
+        print("%s没有外接显示器。%s" % (YELLOW, RESET))
+        return 1
+    ok = True
+    for d in ext:
+        r = core.set_brightness(d, pct)
+        ok = ok and r
+        print("外接 id=%-3s -> %5.1f%%  %s"
+              % (d, pct, GREEN + "ok" + RESET if r else RED + "失败" + RESET))
+    return 0 if ok else 1
+
+
+def do_toggle(enabled):
+    cfg = core.load_config()
+    cfg["enabled"] = enabled
+    core.save_config(cfg)
+    print("跟随已%s%s%s" % (GREEN if enabled else DIM, "开启" if enabled else "关闭", RESET))
+    if not core.watch_pid():
+        print("%s注意：跟随进程没在跑，现在改的只是配置。跑 `brightsync watch` 或 `brightsync install` 才会实际跟随。%s"
+              % (DIM, RESET))
+    return 0
+
+
+def do_map():
+    cfg = core.load_config()
+    print("%s内建 -> 外接%s   （锚点 %s）"
+          % (BOLD, RESET, " ".join("%g->%g" % p for p in cfg["anchors"])))
+    for x in range(0, 101, 5):
+        y = core.map_brightness(x, cfg)
+        print("  %3d%% -> %5.1f%%  %s%s%s" % (x, y, DIM, "█" * int(round(y / 4)), RESET))
+    print("%s改 lib/brightsync.json 的 anchors 即可调映射，watch 进程无需重启。%s" % (DIM, RESET))
+    return 0
+
+
+def do_watch(verbose=True):
+    """常驻：内建屏亮度一变就把外接屏按映射跟过去。"""
+    cfg = core.load_config()
+    mtime = _mtime(CONFIG_PATH)
+    last_internal = None
+    last_target = None
+    last_ext = []
+    tick = 0
+
+    core.register_watch()
+    print("%sbrightsync watch%s  间隔 %.1fs，跟随%s，Ctrl-C 退出"
+          % (BOLD, RESET, cfg["interval"],
+             GREEN + "开启" + RESET if cfg["enabled"] else DIM + "关闭" + RESET))
+    try:
+        while True:
+            tick += 1
+
+            m = _mtime(CONFIG_PATH)
+            if m != mtime:
+                mtime = m
+                cfg = core.load_config()
+                print("%s配置已重载：%s  锚点 %s%s"
+                      % (DIM, "开启" if cfg["enabled"] else "关闭",
+                         " ".join("%g->%g" % p for p in cfg["anchors"]), RESET))
+
+            if tick == 1 or tick % 10 == 0:
+                cur_ext = core.external_ids()
+                if cur_ext != last_ext:
+                    last_ext = cur_ext
+                    print("%s外接屏：%s%s" % (DIM, cur_ext or "无，等待中……", RESET))
+
+            internal = core.get_brightness(core.builtin_id())
+            if internal is None:
+                time.sleep(cfg["interval"])
+                continue
+
+            changed = (last_internal is None
+                       or abs(internal - last_internal) >= cfg["deadband"])
+            if changed:
+                target = core.map_brightness(internal, cfg)
+                if last_target is None or abs(target - last_target) >= cfg["minStep"]:
+                    if cfg["enabled"]:
+                        for d in last_ext:
+                            core.set_brightness(d, target)
+                        if verbose:
+                            print("%5.1f%% -> 外接 %5.1f%%   %s"
+                                  % (internal, target, DIM + time.strftime("%H:%M:%S") + RESET))
+                last_target = target
+                last_internal = internal
+
+            time.sleep(cfg["interval"])
+    except KeyboardInterrupt:
+        print("\n%s停止跟随。%s" % (DIM, RESET))
+        return 0
+    finally:
+        core.unregister_watch()
+
+
+def _mtime(path):
+    try:
+        return os.path.getmtime(path)
+    except OSError:
+        return None
+
+
+# ---------------------------------------------------------------- 自启
+
+def do_install():
+    os.makedirs(os.path.dirname(PLIST_PATH), exist_ok=True)
+    script = os.path.realpath(__file__)
+    # 优先用系统自带 python3：从第三方 venv 里安装时，解释器路径可能随工具升级失效
+    py = "/usr/bin/python3" if os.path.exists("/usr/bin/python3") else sys.executable
+    plist = {
+        "Label": LABEL,
+        "ProgramArguments": [py, script, "watch"],
+        "RunAtLoad": True,
+        "KeepAlive": True,
+        "StandardOutPath": core.LOG_PATH,
+        "StandardErrorPath": core.LOG_PATH,
+        "ProcessType": "Background",
+    }
+    with open(PLIST_PATH, "wb") as f:
+        plistlib.dump(plist, f)
+    _launchctl("bootout", ignore=True)
+    rc = _launchctl("bootstrap")
+    print("已写入 %s" % PLIST_PATH)
+    if rc != 0:
+        print("%sbootstrap 未成功（非登录会话下常见），下次登录会自动加载；"
+              "或手动：launchctl bootstrap gui/%d %s%s"
+              % (YELLOW, os.getuid(), PLIST_PATH, RESET))
+        return 1
+    print("%s已装载，开机自启并常驻。%s" % (GREEN, RESET))
+    return 0
+
+
+def do_uninstall():
+    _launchctl("bootout", ignore=True)
+    if os.path.exists(PLIST_PATH):
+        os.remove(PLIST_PATH)
+        print("已删除 %s" % PLIST_PATH)
+    else:
+        print("没有找到 %s" % PLIST_PATH)
+    return 0
+
+
+def _launchctl(action, ignore=False):
+    cmd = {
+        "bootstrap": ["launchctl", "bootstrap", "gui/%d" % os.getuid(), PLIST_PATH],
+        "bootout": ["launchctl", "bootout", "gui/%d/%s" % (os.getuid(), LABEL)],
+    }[action]
+    r = subprocess.run(cmd, capture_output=True, text=True)
+    if r.returncode != 0 and not ignore:
+        msg = (r.stderr or r.stdout).strip()
+        if msg:
+            print("%s%s%s" % (DIM, msg, RESET), file=sys.stderr)
+    return r.returncode
+
+
+# ---------------------------------------------------------------- CLI
+
+def main():
+    try:
+        sys.stdout.reconfigure(line_buffering=True)
+    except (AttributeError, ValueError):
+        pass
+
+    ap = argparse.ArgumentParser(
+        prog="brightsync",
+        description="按内建屏亮度自动调整外接显示器亮度",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="示例:\n"
+               "  brightsync status        看当前两边亮度与映射目标\n"
+               "  brightsync sync          立刻同步一次\n"
+               "  brightsync off           暂停跟随（进程保留，随时 on 回来）\n"
+               "  brightsync watch         常驻跟随\n"
+               "  brightsync map           打印映射表，校锚点用\n")
+    sub = ap.add_subparsers(dest="cmd")
+
+    sp = sub.add_parser("status", help="查看亮度与映射结果")
+    sp.add_argument("--json", action="store_true")
+
+    sp = sub.add_parser("sync", help="同步一次")
+    sp.add_argument("-n", "--dry-run", action="store_true", help="只打印不写入")
+
+    sp = sub.add_parser("set", help="直接设置外接屏亮度(%)")
+    sp.add_argument("pct", type=float)
+
+    sub.add_parser("on", help="开启跟随")
+    sub.add_parser("off", help="关闭跟随（保留 watch 进程）")
+    sub.add_parser("map", help="打印映射对照表")
+    sub.add_parser("watch", help="常驻跟随")
+    sub.add_parser("install", help="装 LaunchAgent 开机自启")
+    sub.add_parser("uninstall", help="卸载 LaunchAgent")
+
+    args = ap.parse_args()
+
+    if args.cmd == "status":
+        return do_status(args.json)
+    if args.cmd == "sync":
+        return do_sync(args.dry_run)
+    if args.cmd == "set":
+        return do_set(max(0.0, min(100.0, args.pct)))
+    if args.cmd == "on":
+        return do_toggle(True)
+    if args.cmd == "off":
+        return do_toggle(False)
+    if args.cmd == "map":
+        return do_map()
+    if args.cmd == "watch":
+        return do_watch()
+    if args.cmd == "install":
+        return do_install()
+    if args.cmd == "uninstall":
+        return do_uninstall()
+
+    ap.print_help()
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

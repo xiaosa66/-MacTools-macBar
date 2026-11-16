@@ -11,6 +11,7 @@ let HOME = NSHomeDirectory()
 let FALLBACK_ROOT = HOME + "/Desktop/MacTools-v2"
 let MANAGER_PORT = 8800
 let MACSTAT_PORT = 8787
+let BRIGHTSYNC_PORT = 8766
 let REFRESH_SECONDS: TimeInterval = 5
 
 // ------------------------------------------------------------------ 基础工具
@@ -107,6 +108,9 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     var lastData: [String: Any]?
     var lastError = ""
     var lastUpdate: Date?
+    var lastBright: [String: Any]?   // brightsync 状态快照
+    var brightUp = false             // 8766 是否在跑
+    var refreshing = false
 
     func applicationDidFinishLaunching(_: Notification) {
         logLine("boot: root=\(root) node=\(findNode())")
@@ -166,15 +170,29 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     // ------------------------------------------------------------ 数据刷新
 
     func refresh() {
-        guard let snap = fetchJSON("http://127.0.0.1:\(MACSTAT_PORT)/api/status") else {
-            lastError = portOpen(MACSTAT_PORT) ? "采样服务无响应" : "采样服务未运行"
-            DispatchQueue.main.async { self.render() }
-            return
+        if refreshing { return }
+        refreshing = true
+        DispatchQueue.global(qos: .utility).async { [weak self] in
+            guard let self = self else { return }
+            if let snap = fetchJSON("http://127.0.0.1:\(MACSTAT_PORT)/api/status") {
+                self.lastError = ""
+                self.lastData = snap
+                self.lastUpdate = Date()
+            } else {
+                self.lastError = portOpen(MACSTAT_PORT) ? "采样服务无响应" : "采样服务未运行"
+            }
+
+            // 亮度面板：没启动就不打扰（不主动拉起，守住「平时不占端口」）
+            self.brightUp = portOpen(BRIGHTSYNC_PORT, waitMs: 120)
+            self.lastBright = self.brightUp
+                ? fetchJSON("http://127.0.0.1:\(BRIGHTSYNC_PORT)/api/status", timeout: 2)
+                : nil
+
+            DispatchQueue.main.async {
+                self.refreshing = false
+                self.render()
+            }
         }
-        lastError = ""
-        lastData = snap
-        lastUpdate = Date()
-        DispatchQueue.main.async { self.render() }
     }
 
     func render() {
@@ -256,6 +274,40 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         }
 
         menu.addItem(NSMenuItem.separator())
+
+        // ---- 外接屏亮度跟随（独立于 macstat，macstat 挂了也照常显示）----
+        let bs = lastBright
+        let binB = (bs?["builtin"] as? [String: Any])?["brightness"] as? Double
+        let extArr = bs?["external"] as? [[String: Any]] ?? []
+        let extCur = extArr.first?["current"] as? Double
+        let extMap = extArr.first?["mapped"] as? Double
+        let bsOn = bs?["enabled"] as? Bool ?? false
+        let bsPid = bs?["pid"] as? Int
+
+        if let binB = binB {
+            var line = String(format: "🔆  亮度       内建 %.0f%%", binB)
+            if let c = extCur { line += String(format: " · 外接 %.0f%%", c) }
+            row(line)
+            if let m = extMap {
+                row(String(format: "      映射目标  %.0f%%", m))
+            }
+            let state = bsOn ? "跟随开启" : "跟随暂停"
+            if let p = bsPid {
+                row("      \(state) · pid \(p)")
+            } else {
+                row("      \(state) · 进程未运行")
+            }
+            row(bsOn ? "暂停跟随" : "恢复跟随", #selector(toggleBright))
+            row("打开亮度面板…", #selector(openBrightPanel))
+        } else if brightUp {
+            row("🔆  亮度       面板无响应")
+            row("打开亮度面板…", #selector(openBrightPanel))
+        } else {
+            row("🔆  亮度跟随   未启动")
+            row("启动亮度面板…", #selector(startBright))
+        }
+
+        menu.addItem(NSMenuItem.separator())
         if let t = lastUpdate {
             let f = DateFormatter()
             f.dateFormat = "HH:mm:ss"
@@ -291,6 +343,20 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     @objc func stopAll() {
         post("http://127.0.0.1:\(MANAGER_PORT)/api/services/disk/stop")
         post("http://127.0.0.1:\(MANAGER_PORT)/api/services/macstat/stop")
+        post("http://127.0.0.1:\(MANAGER_PORT)/api/services/brightsync/stop")
+    }
+    @objc func toggleBright() {
+        // 不带 body 的 POST 即「取反当前状态」，服务端自己判断
+        post("http://127.0.0.1:\(BRIGHTSYNC_PORT)/api/toggle")
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) { self.refresh() }
+    }
+    @objc func openBrightPanel() { openURL("http://127.0.0.1:\(BRIGHTSYNC_PORT)/") }
+    @objc func startBright() {
+        post("http://127.0.0.1:\(MANAGER_PORT)/api/services/brightsync/start")
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) {
+            self.openURL("http://127.0.0.1:\(BRIGHTSYNC_PORT)/")
+            self.refresh()
+        }
     }
     @objc func restartMacstat() {
         post("http://127.0.0.1:\(MANAGER_PORT)/api/services/macstat/start")

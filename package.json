@@ -7,6 +7,7 @@
     "macstat": "./bin/macstat",
     "macstat-web": "./bin/macstat-web",
     "disk-report": "./bin/disk-report",
+    "brightsync": "./bin/brightsync",
     "mac-tools": "./bin/mac-tools"
   },
   "scripts": {
