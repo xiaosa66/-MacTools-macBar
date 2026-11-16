@@ -1,0 +1,9 @@
+{
+  "_comment": "brightsync 默认映射模板。anchors 为 [[内建%, 外接%], ...]，分段线性插值。运行时改动写到 ~/Library/Application Support/MacTools/brightsync.json，本文件保持不动。",
+  "enabled": true,
+  "anchors": [[0, 0], [25, 18], [50, 40], [75, 68], [100, 100]],
+  "clamp": [0, 100],
+  "deadband": 2,
+  "minStep": 1,
+  "interval": 0.5
+}

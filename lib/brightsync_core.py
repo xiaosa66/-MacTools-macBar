@@ -13,8 +13,14 @@ import subprocess
 from ctypes import POINTER, byref, c_float, c_uint32
 
 ROOT = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
-CONFIG_PATH = os.path.join(ROOT, "lib", "brightsync.json")
-PID_PATH = os.path.expanduser("~/Library/Application Support/MacTools/brightsync.pid")
+
+# 运行时配置放用户目录，仓库里只留默认模板 —— 否则每调一次映射工作区就变脏。
+SUPPORT_DIR = os.path.expanduser("~/Library/Application Support/MacTools")
+CONFIG_PATH = os.path.join(SUPPORT_DIR, "brightsync.json")
+PID_PATH = os.path.join(SUPPORT_DIR, "brightsync.pid")
+TEMPLATE_PATH = os.path.join(ROOT, "lib", "brightsync.default.json")
+# 老版本把运行时配置写在仓库里，留着做一次性迁移
+LEGACY_PATH = os.path.join(ROOT, "lib", "brightsync.json")
 LOG_PATH = os.path.expanduser("~/Library/Logs/brightsync.log")
 
 DEFAULT_CONFIG = {
@@ -83,31 +89,62 @@ def set_brightness(display_id, pct):
 
 # ---------------------------------------------------------------- 配置
 
-def load_config():
-    cfg = dict(DEFAULT_CONFIG)
+def _read_json(path):
+    """读一个 JSON 配置，跳过 `_` 开头的注释键；读不到/不合法返回 None。"""
     try:
-        with open(CONFIG_PATH, "r", encoding="utf-8") as f:
-            user = json.load(f)
-        cfg.update({k: v for k, v in user.items() if not k.startswith("_")})
-    except FileNotFoundError:
-        pass
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
     except (OSError, ValueError):
-        pass
+        return None
+    if not isinstance(data, dict):
+        return None
+    return {k: v for k, v in data.items() if not k.startswith("_")}
+
+
+def load_config():
+    """优先级：内置默认 < 仓库模板 lib/brightsync.default.json < 用户运行时配置。"""
+    cfg = dict(DEFAULT_CONFIG)
+    cfg.update(_read_json(TEMPLATE_PATH) or {})
+
+    # 老版本把运行时配置写在仓库里，第一次跑自动搬到用户目录
+    if not os.path.exists(CONFIG_PATH):
+        legacy = _read_json(LEGACY_PATH)
+        if legacy:
+            cfg.update(legacy)
+            try:
+                _write_config(cfg)
+            except OSError:
+                pass
+
+    cfg.update(_read_json(CONFIG_PATH) or {})
     cfg["anchors"] = sorted((float(a[0]), float(a[1])) for a in cfg["anchors"])
     return cfg
 
 
 def save_config(cfg):
-    """原子写：先写临时文件再 replace，避免 watch 读到半截 JSON。
+    """写运行时配置（原子写：先写临时文件再 replace，避免 watch 读到半截 JSON）。"""
+    _write_config(cfg)
+    return load_config()
 
-    手写序列化而不是 json.dump(indent=2)：后者会把每个锚点摊成多行（33 行的文件），
+
+def reset_config():
+    """删掉运行时配置，回落到仓库模板 / 内置默认。"""
+    try:
+        os.remove(CONFIG_PATH)
+    except OSError:
+        pass
+    return load_config()
+
+
+def _write_config(cfg):
+    """手写序列化而不是 json.dump(indent=2)：后者会把每个锚点摊成多行，
     这份配置是要人肉读改的，锚点保持一行一对更好看。
     """
     pts = ", ".join("[%s, %s]" % (_num(a), _num(b)) for a, b in cfg["anchors"])
     lo, hi = cfg["clamp"]
     text = (
         "{\n"
-        '  "_comment": "brightsync 映射配置。anchors 为 [[内建%%, 外接%%], ...]，分段线性插值，改完 watch 自动重载。",\n'
+        '  "_comment": "brightsync 运行时配置。anchors 为 [[内建%%, 外接%%], ...]，分段线性插值，改完 watch 自动重载。删掉本文件即回落到 lib/brightsync.default.json。",\n'
         '  "enabled": %s,\n'
         '  "anchors": [%s],\n'
         '  "clamp": [%s, %s],\n'
@@ -119,11 +156,11 @@ def save_config(cfg):
          pts, _num(lo), _num(hi),
          _num(cfg["deadband"]), _num(cfg["minStep"]), _num(cfg["interval"]))
 
+    os.makedirs(SUPPORT_DIR, exist_ok=True)
     tmp = CONFIG_PATH + ".tmp"
     with open(tmp, "w", encoding="utf-8") as f:
         f.write(text)
     os.replace(tmp, CONFIG_PATH)
-    return load_config()
 
 
 def _num(v):
@@ -250,6 +287,7 @@ def state(cfg=None):
             "minStep": cfg["minStep"],
             "interval": cfg["interval"],
         },
+        "paths": {"config": CONFIG_PATH, "template": TEMPLATE_PATH},
     }
 
 

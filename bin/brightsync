@@ -13,8 +13,11 @@
     brightsync map             # 打印映射对照表，用来校锚点
     brightsync install         # 装 LaunchAgent，开机自启常驻跟随
     brightsync uninstall       # 卸掉自启
+    brightsync reset           # 映射恢复默认，回到模板值
 
-配置: lib/brightsync.json。映射: core.map_brightness()，可整段替换成任意曲线。
+配置: ~/Library/Application Support/MacTools/brightsync.json（运行时，改完 watch 自动重载）
+模板: lib/brightsync.default.json（跟着仓库走，删掉运行时配置即回落到它）
+映射: core.map_brightness()，可整段替换成任意曲线。
 """
 
 import argparse
@@ -126,7 +129,14 @@ def do_map():
     for x in range(0, 101, 5):
         y = core.map_brightness(x, cfg)
         print("  %3d%% -> %5.1f%%  %s%s%s" % (x, y, DIM, "█" * int(round(y / 4)), RESET))
-    print("%s改 lib/brightsync.json 的 anchors 即可调映射，watch 进程无需重启。%s" % (DIM, RESET))
+    print("%s锚点改 %s ，watch 进程无需重启。%s" % (DIM, CONFIG_PATH, RESET))
+    return 0
+
+
+def do_reset():
+    cfg = core.reset_config()
+    print("%s已恢复默认映射，当前锚点：%s%s"
+          % (GREEN, " ".join("%g->%g" % p for p in cfg["anchors"]), RESET))
     return 0
 
 
@@ -283,6 +293,7 @@ def main():
     sub.add_parser("watch", help="常驻跟随")
     sub.add_parser("install", help="装 LaunchAgent 开机自启")
     sub.add_parser("uninstall", help="卸载 LaunchAgent")
+    sub.add_parser("reset", help="映射恢复默认值")
 
     args = ap.parse_args()
 
@@ -304,6 +315,8 @@ def main():
         return do_install()
     if args.cmd == "uninstall":
         return do_uninstall()
+    if args.cmd == "reset":
+        return do_reset()
 
     ap.print_help()
     return 0

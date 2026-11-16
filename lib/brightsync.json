@@ -1,9 +1,0 @@
-{
-  "_comment": "brightsync 映射配置。anchors 为 [[内建%, 外接%], ...]，分段线性插值，改完 watch 自动重载。",
-  "enabled": true,
-  "anchors": [[0, 0], [25, 18], [50, 40], [75, 68], [100, 100]],
-  "clamp": [0, 100],
-  "deadband": 2,
-  "minStep": 1,
-  "interval": 0.5
-}

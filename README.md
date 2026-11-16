@@ -28,7 +28,7 @@ MacTools/
 │   ├── services.json       服务注册表：新增工具改这里即可
 │   ├── dashboard.html      控制台页面
 │   ├── brightsync_core.py  亮度读写 / 配置 / 映射（CLI 与面板共用）
-│   └── brightsync.json     映射锚点与参数
+│   └── brightsync.default.json  默认映射模板（运行时配置在 ~/Library/Application Support/MacTools/）
 ├── bin/
 │   ├── mac-tools           控制台启动器
 │   ├── macstat             命令行速览（Python，秒级采样）
@@ -78,17 +78,21 @@ brightsync map              # 打印映射对照表
 brightsync watch            # 常驻跟随，Ctrl-C 退出
 brightsync install          # 装 LaunchAgent：开机自启 + 崩溃自动拉起
 brightsync uninstall        # 卸掉
+brightsync reset            # 映射恢复默认（删运行时配置，回落模板）
 ```
 
 注意「跟随进程」是独立于面板的常驻进程：面板关掉不影响跟随，面板只负责看和改配置。
 进程状态记在 `~/Library/Application Support/MacTools/brightsync.pid`。
 
-映射关系在 `lib/brightsync.json`，`anchors` 是 `[[内建%, 外接%], ...]` 的分段线性锚点，
-改完 `watch` 自动重载（0.5 秒内生效，不用重启）：
+映射关系在 `~/Library/Application Support/MacTools/brightsync.json`（运行时配置，面板保存的就是它），
+`anchors` 是 `[[内建%, 外接%], ...]` 的分段线性锚点，改完 `watch` 自动重载（0.5 秒内生效，不用重启）：
 
 ```json
 "anchors": [[0, 0], [25, 18], [50, 40], [75, 68], [100, 100]]
 ```
+
+仓库里只放默认模板 `lib/brightsync.default.json`；删掉运行时配置即回落到模板值
+（或直接 `brightsync reset`）。这样调整映射不会弄脏工作区。
 
 默认曲线让外接屏整体略暗于内建屏（暗环境下不刺眼），要 1:1 就写 `[[0,0],[100,100]]`。
 想换成任意曲线（gamma、按时间段分段等），替换 `bin/brightsync` 里的 `map_brightness()` 函数体即可。

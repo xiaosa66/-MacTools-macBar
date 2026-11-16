@@ -188,6 +188,8 @@ PAGE = r"""<!DOCTYPE html>
   button.act:disabled{opacity:.45;cursor:default}
   svg{display:block;touch-action:none;cursor:crosshair;width:100%;height:auto}
   .hint{font-size:12px;color:var(--dim);margin-top:6px}
+  .hint.warn{color:var(--warn);margin:0;font-size:12px}
+  .hint.done{color:var(--ok);margin:0;font-size:12px}
   .pill{font-size:11.5px;padding:2px 9px;border-radius:20px;border:1px solid var(--line);color:var(--dim)}
   .pill.ok{color:var(--ok);border-color:#238636;background:rgba(63,185,80,.12)}
   .pill.off{color:var(--warn);border-color:#5c4813;background:rgba(210,153,34,.1)}
@@ -226,84 +228,144 @@ PAGE = r"""<!DOCTYPE html>
   <div class="row" style="margin-bottom:10px">
     <div><div class="label">映射曲线</div>
       <div style="font-size:12px;color:var(--dim);margin-top:2px">拖动锚点改形状，松开后点保存</div></div>
-    <div style="display:flex;gap:6px;flex-wrap:wrap">
+    <div style="display:flex;gap:6px;flex-wrap:wrap;align-items:center">
+      <span class="hint" id="saveHint"></span>
       <button class="act" onclick="preset('even')">1:1</button>
       <button class="act" onclick="preset('dimmer')">偏暗</button>
       <button class="act" onclick="preset('night')">夜间</button>
+      <button class="act" id="revertBtn" onclick="revert()" disabled>还原</button>
       <button class="act primary" id="saveBtn" onclick="save()" disabled>保存</button>
     </div>
   </div>
-  <svg id="curve" viewBox="0 0 340 300"></svg>
+  <svg id="curve" viewBox="0 0 340 300">
+    <g id="gGrid"></g>
+    <line id="lRef" stroke="#30363d" stroke-dasharray="4 4"/>
+    <polyline id="pLine" fill="none" stroke="#58a6ff" stroke-width="2.5" stroke-linejoin="round"/>
+    <g id="gWork"><line id="lWork" stroke="#3fb950" stroke-width="1" stroke-dasharray="3 3" opacity=".7"/>
+      <circle id="cWork" r="4" fill="#3fb950"/></g>
+    <g id="gAnchors"></g>
+  </svg>
   <div class="hint">横轴 = 内建屏亮度，纵轴 = 外接屏亮度。拖动圆点调整；两点之间的连线是实际映射。</div>
 </div>
 
 <div class="card">
   <div class="label" style="margin-bottom:8px">参数</div>
   <div class="grid">
-    <div class="kv"><span>响应阈值 deadband</span><span><input type="number" id="pDead" min="0" max="20" step="0.5"> %</span></div>
-    <div class="kv"><span>最小步进 minStep</span><span><input type="number" id="pStep" min="0.5" max="20" step="0.5"> %</span></div>
-    <div class="kv"><span>轮询间隔 interval</span><span><input type="number" id="pInt" min="0.2" max="5" step="0.1"> s</span></div>
-    <div class="kv"><span>外接下限 clamp</span><span><input type="number" id="pLo" min="0" max="100" step="1"> %</span></div>
+    <div class="kv"><span>响应阈值 deadband</span><span><input type="number" id="pDead" min="0" max="20" step="0.5" oninput="markDirty()"> %</span></div>
+    <div class="kv"><span>最小步进 minStep</span><span><input type="number" id="pStep" min="0.5" max="20" step="0.5" oninput="markDirty()"> %</span></div>
+    <div class="kv"><span>轮询间隔 interval</span><span><input type="number" id="pInt" min="0.2" max="5" step="0.1" oninput="markDirty()"> s</span></div>
+    <div class="kv"><span>外接下限 clamp</span><span><input type="number" id="pLo" min="0" max="100" step="1" oninput="markDirty()"> %</span></div>
   </div>
-  <div class="hint">改完参数要点上面的「保存」。</div>
+  <div class="hint">改完参数点和曲线一样都要点「保存」。未保存时页面不会自动刷新覆盖你的输入。</div>
 </div>
 
 <footer>
-  映射改完 watch 在 0.5 秒内自动重载 · 日志 <code>~/Library/Logs/brightsync.log</code><br>
-  命令行等价：<code>brightsync status</code> / <code>brightsync on|off</code> / <code>brightsync watch</code>
+  映射改完 watch 在 0.5 秒内自动重载 · 配置 <code id="cfgPath">~/Library/Application Support/MacTools/brightsync.json</code><br>
+  命令行等价：<code>brightsync status</code> / <code>brightsync on|off</code> / <code>brightsync reset</code>
 </footer>
 
 <script>
 const $ = id => document.getElementById(id);
+const NS = 'http://www.w3.org/2000/svg';
 const W = 340, H = 300, PAD = 34;
 let ST = null, anchors = null, dirty = false, dragIdx = -1;
 
 const sx = v => PAD + (v / 100) * (W - PAD - 12);
 const sy = v => H - PAD - (v / 100) * (H - PAD - 14);
 
-function draw(){
-  const svg = $('curve');
-  if(!anchors) return;
-  let g = '';
-  // 网格
-  for(let v=0; v<=100; v+=25){
-    g += `<line x1="${sx(v)}" y1="${sy(0)}" x2="${sx(v)}" y2="${sy(100)}" stroke="#21262d" stroke-width="1"/>`;
-    g += `<line x1="${sx(0)}" y1="${sy(v)}" x2="${sx(100)}" y2="${sy(v)}" stroke="#21262d" stroke-width="1"/>`;
-    g += `<text x="${sx(v)}" y="${sy(0)+16}" fill="#8b949e" font-size="10" text-anchor="middle">${v}</text>`;
-    g += `<text x="${sx(0)-8}" y="${sy(v)+3}" fill="#8b949e" font-size="10" text-anchor="end">${v}</text>`;
+// 网格刻度是固定的，只建一次
+(function initGrid(){
+  let s = '';
+  for(let v = 0; v <= 100; v += 25){
+    s += `<line x1="${sx(v)}" y1="${sy(0)}" x2="${sx(v)}" y2="${sy(100)}" stroke="#21262d"/>`;
+    s += `<line x1="${sx(0)}" y1="${sy(v)}" x2="${sx(100)}" y2="${sy(v)}" stroke="#21262d"/>`;
+    s += `<text x="${sx(v)}" y="${sy(0)+16}" fill="#8b949e" font-size="10" text-anchor="middle">${v}</text>`;
+    s += `<text x="${sx(0)-8}" y="${sy(v)+3}" fill="#8b949e" font-size="10" text-anchor="end">${v}</text>`;
   }
-  // 1:1 参考线
-  g += `<line x1="${sx(0)}" y1="${sy(0)}" x2="${sx(100)}" y2="${sy(100)}" stroke="#30363d" stroke-dasharray="4 4"/>`;
-  // 曲线
-  const pts = anchors.map(a => `${sx(a[0])},${sy(a[1])}`).join(' ');
-  g += `<polyline points="${pts}" fill="none" stroke="#58a6ff" stroke-width="2.5" stroke-linejoin="round"/>`;
-  // 当前工作点
-  if(ST && ST.builtin.brightness != null && ST.external.length){
-    const bx = ST.builtin.brightness, by = ST.external[0].mapped;
-    g += `<circle cx="${sx(bx)}" cy="${sy(by)}" r="4" fill="#3fb950"/>`;
-    g += `<line x1="${sx(bx)}" y1="${sy(0)}" x2="${sx(bx)}" y2="${sy(by)}" stroke="#3fb950" stroke-width="1" stroke-dasharray="3 3" opacity=".7"/>`;
-  }
-  // 锚点
-  anchors.forEach((a,i)=>{
-    const cx = sx(a[0]), cy = sy(a[1]);
-    const ty = Math.max(10, cy - 12);
-    const anchor = cx > W - 46 ? 'end' : (cx < 46 ? 'start' : 'middle');
-    g += `<circle cx="${cx}" cy="${cy}" r="7" fill="#161b22" stroke="#58a6ff" stroke-width="2" data-i="${i}" style="cursor:grab"/>`;
-    g += `<text x="${cx}" y="${ty}" fill="#58a6ff" font-size="10" text-anchor="${anchor}">${Math.round(a[1])}</text>`;
+  $('gGrid').innerHTML = s;
+  const ref = $('lRef');
+  ref.setAttribute('x1', sx(0)); ref.setAttribute('y1', sy(0));
+  ref.setAttribute('x2', sx(100)); ref.setAttribute('y2', sy(100));
+})();
+
+// 锚点元素复用，绝不重建 —— 重建会让正在拖的圆点失去 pointer capture，
+// 表现就是「拖到一半被刷新打断」。
+const dotEls = [];
+function dotAt(i){
+  if(dotEls[i]) return dotEls[i];
+  const c = document.createElementNS(NS, 'circle');
+  c.setAttribute('r', 7);
+  c.setAttribute('fill', '#161b22');
+  c.setAttribute('stroke', '#58a6ff');
+  c.setAttribute('stroke-width', 2);
+  c.style.cursor = 'grab';
+  c.addEventListener('pointerdown', e=>{
+    e.preventDefault();
+    dragIdx = i;
+    c.setPointerCapture(e.pointerId);
+    c.style.cursor = 'grabbing';
   });
-  svg.innerHTML = g;
-  svg.querySelectorAll('circle[data-i]').forEach(el=>{
-    el.addEventListener('pointerdown', e=>{
-      e.preventDefault();
-      dragIdx = +el.dataset.i;
-      el.setPointerCapture(e.pointerId);
-    });
+  const t = document.createElementNS(NS, 'text');
+  t.setAttribute('fill', '#58a6ff');
+  t.setAttribute('font-size', '10');
+  $('gAnchors').appendChild(c);
+  $('gAnchors').appendChild(t);
+  return (dotEls[i] = {c, t});
+}
+
+function syncDots(){
+  for(let i = dotEls.length - 1; i >= 0; i--){
+    if(i >= anchors.length){
+      dotEls[i].c.remove(); dotEls[i].t.remove(); dotEls.splice(i, 1);
+    }
+  }
+  anchors.forEach((a, i)=>{
+    const {c, t} = dotAt(i);
+    const cx = sx(a[0]), cy = sy(a[1]);
+    c.setAttribute('cx', cx); c.setAttribute('cy', cy);
+    t.setAttribute('x', cx);
+    t.setAttribute('y', Math.max(10, cy - 12));
+    t.setAttribute('text-anchor', cx > W - 46 ? 'end' : (cx < 46 ? 'start' : 'middle'));
+    t.textContent = Math.round(a[1]);
   });
 }
 
+// 前端算一份映射，拖锚点时工作点即时跟着走，不等服务端
+function localMap(x){
+  const p = anchors;
+  if(!p || !p.length) return x;
+  if(x <= p[0][0]) return p[0][1];
+  if(x >= p[p.length-1][0]) return p[p.length-1][1];
+  for(let i = 0; i < p.length - 1; i++){
+    const [x0,y0] = p[i], [x1,y1] = p[i+1];
+    if(x0 <= x && x <= x1){
+      const sp = x1 - x0;
+      return sp <= 0 ? y0 : y0 + (y1 - y0) * (x - x0) / sp;
+    }
+  }
+  return x;
+}
+
+function draw(){
+  if(!anchors) return;
+  $('pLine').setAttribute('points', anchors.map(a=>`${sx(a[0])},${sy(a[1])}`).join(' '));
+  const wg = $('gWork');
+  const bx = ST && ST.builtin.brightness;
+  if(bx != null){
+    const lo = parseFloat($('pLo').value) || 0;
+    const by = Math.max(lo, Math.min(100, localMap(bx)));
+    $('cWork').setAttribute('cx', sx(bx)); $('cWork').setAttribute('cy', sy(by));
+    $('lWork').setAttribute('x1', sx(bx)); $('lWork').setAttribute('x2', sx(bx));
+    $('lWork').setAttribute('y1', sy(0));  $('lWork').setAttribute('y2', sy(by));
+    wg.style.display = '';
+  } else {
+    wg.style.display = 'none';
+  }
+  syncDots();
+}
+
 function toData(e){
-  const svg = $('curve');
-  const r = svg.getBoundingClientRect();
+  const r = $('curve').getBoundingClientRect();
   const px = (e.clientX - r.left) / r.width * W;
   const py = (e.clientY - r.top) / r.height * H;
   return [
@@ -316,24 +378,57 @@ $('curve').addEventListener('pointermove', e=>{
   if(dragIdx < 0) return;
   const [x,y] = toData(e);
   const a = anchors[dragIdx];
-  // 首尾锚点锁定 x，中间锚点限制在相邻之间
-  if(dragIdx === 0) a[1] = Math.round(y);
-  else if(dragIdx === anchors.length-1) a[1] = Math.round(y);
-  else {
+  // 首尾锚点锁 x（必须覆盖 0/100），中间锚点限制在相邻之间
+  if(dragIdx === 0 || dragIdx === anchors.length - 1){
+    a[1] = Math.round(y);
+  } else {
     const lo = anchors[dragIdx-1][0] + 1, hi = anchors[dragIdx+1][0] - 1;
     a[0] = Math.round(Math.max(lo, Math.min(hi, x)));
     a[1] = Math.round(y);
   }
-  dirty = true; $('saveBtn').disabled = false;
+  markDirty();
   draw();
 });
-['pointerup','pointercancel'].forEach(ev=>$('curve').addEventListener(ev, ()=>{ dragIdx = -1; }));
+['pointerup','pointercancel'].forEach(ev=>$('curve').addEventListener(ev, e=>{
+  if(dragIdx >= 0 && dotEls[dragIdx]) dotEls[dragIdx].c.style.cursor = 'grab';
+  dragIdx = -1;
+}));
+
+// ------------------------------------------------ 未保存状态
+function setHint(text, cls){
+  const el = $('saveHint');
+  el.textContent = text || '';
+  el.className = 'hint' + (cls ? ' ' + cls : '');
+}
+
+function markDirty(){
+  if(dirty) return;
+  dirty = true;
+  $('saveBtn').disabled = false;
+  $('revertBtn').disabled = false;
+  setHint('未保存', 'warn');
+}
+
+function clearDirty(){
+  dirty = false;
+  $('saveBtn').disabled = true;
+  $('revertBtn').disabled = true;
+}
+
+function applyConfig(c){
+  anchors = c.anchors.map(a=>[a[0], a[1]]);
+  $('pDead').value = c.deadband;
+  $('pStep').value = c.minStep;
+  $('pInt').value = c.interval;
+  $('pLo').value = c.clamp[0];
+  draw();
+}
 
 function preset(kind){
   if(kind === 'even') anchors = [[0,0],[100,100]];
   if(kind === 'dimmer') anchors = [[0,0],[25,18],[50,40],[75,68],[100,100]];
   if(kind === 'night') anchors = [[0,0],[25,10],[50,25],[75,45],[100,70]];
-  dirty = true; $('saveBtn').disabled = false;
+  markDirty();
   draw();
 }
 
@@ -364,20 +459,17 @@ function render(){
   btn.textContent = s.watching ? '停止进程' : '启动进程';
   btn.classList.toggle('primary', !s.watching);
 
-  if(!dirty){
-    anchors = s.config.anchors.map(a=>[a[0],a[1]]);
-    $('pDead').value = s.config.deadband;
-    $('pStep').value = s.config.minStep;
-    $('pInt').value = s.config.interval;
-    $('pLo').value = s.config.clamp[0];
-    draw();
-  }
+  // 有未保存改动时绝不回写表单，否则输入框会被轮询冲掉
+  if(!dirty) applyConfig(s.config);
+  draw();
 }
 
 async function refresh(){
+  if(dragIdx >= 0) return;  // 拖动中不打断
   try{
     const r = await fetch('/api/status', {cache:'no-store'});
     ST = await r.json();
+    if(ST.paths && ST.paths.config) $('cfgPath').textContent = ST.paths.config;
     render();
   }catch(e){}
 }
@@ -397,24 +489,44 @@ async function toggleDaemon(){
   setTimeout(()=>{ btn.disabled = false; refresh(); }, 700);
 }
 
+function revert(){
+  clearDirty();
+  setHint('已还原', '');
+  if(ST) applyConfig(ST.config);
+}
+
 async function save(){
+  for(const [id, name] of [['pDead','响应阈值'],['pStep','最小步进'],['pInt','轮询间隔'],['pLo','外接下限']]){
+    const v = parseFloat($(id).value);
+    if(!isFinite(v)){ alert('「' + name + '」不是有效数字'); $(id).focus(); return; }
+  }
+  const hi = (ST && ST.config && ST.config.clamp) ? ST.config.clamp[1] : 100;
   const body = {
     anchors: anchors,
     deadband: parseFloat($('pDead').value),
     minStep: parseFloat($('pStep').value),
     interval: parseFloat($('pInt').value),
-    clamp: [parseFloat($('pLo').value), 100],
+    clamp: [parseFloat($('pLo').value), hi],
   };
+  $('saveBtn').disabled = true;
   const r = await fetch('/api/config', {method:'POST', headers:{'Content-Type':'application/json'},
     body: JSON.stringify(body)});
   const d = await r.json();
   if(d.ok){
-    dirty = false; $('saveBtn').disabled = true;
-    ST = d.state; render();
+    ST = d.state;
+    clearDirty();
+    applyConfig(ST.config);
+    setHint('已保存', 'done');
   } else {
+    $('saveBtn').disabled = false;
+    setHint('未保存', 'warn');
     alert('保存失败：' + (d.error || '未知错误'));
   }
 }
+
+window.addEventListener('beforeunload', e=>{
+  if(dirty){ e.preventDefault(); e.returnValue = ''; }
+});
 
 refresh();
 setInterval(refresh, 1500);
